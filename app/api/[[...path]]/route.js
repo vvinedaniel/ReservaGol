@@ -105,6 +105,8 @@ async function publishBlockers(supabase, arena) {
 // ---- Phase 02C helpers (recurring reservations / mensalistas) ----
 const RECUR_WINDOW_DAYS = 90
 const RECUR_TOPUP_THRESHOLD = 80 // só recarrega quando faltam poucos dias de janela
+// Projeção explícita de recurring_reservations (nunca `*`): colunas de negócio da série.
+const RECURRING_SERIES_COLUMNS = 'id,organization_id,arena_id,court_id,customer_id,frequency,weekday,day_of_month,start_time,end_time,start_date,end_date,has_no_end_date,status,default_price,notes,is_demo,created_by,created_at,updated_at'
 function pad2(n) { return String(n).padStart(2, '0') }
 function weekdayOf(dateStr) { return new Date(`${dateStr}T12:00:00${ARENA_OFFSET}`).getUTCDay() }
 function dateAddDays(dateStr, n) {
@@ -615,7 +617,7 @@ async function handleRoute(request, { params }) {
       if (!arena) return json({ error: 'Arena não encontrada' }, 404)
       // Top-up idempotente e guardado das séries ativas desta arena (barato quando a janela já está cheia).
       try {
-        const { data: aSeries } = await supabase.from('recurring_reservations').select('*').eq('arena_id', arena_id).eq('status', 'ACTIVE')
+        const { data: aSeries } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('arena_id', arena_id).eq('status', 'ACTIVE')
         for (const s of (aSeries || [])) { await topUpSeries(supabase, s, user.id) }
       } catch (e) { console.error('agenda topup', e?.message) }
       const [{ data: org }, { data: courts }] = await Promise.all([
@@ -761,7 +763,7 @@ async function handleRoute(request, { params }) {
           start_time: transient.start_time, end_time: transient.end_time, start_date: transient.start_date,
           end_date: transient.end_date, has_no_end_date: transient.has_no_end_date,
           default_price: transient.default_price, notes: transient.notes, is_demo: !!body.is_demo, created_by: user.id, status: 'ACTIVE',
-        }).select().maybeSingle()
+        }).select(RECURRING_SERIES_COLUMNS).maybeSingle()
         if (sErr || !series) return json({ error: 'Sem permissão para criar mensalista' }, 403)
 
         const mat = await materialize(supabase, { ...transient, id: series.id }, prev.toCreate, user.id)
@@ -774,10 +776,10 @@ async function handleRoute(request, { params }) {
         const organization_id = url.searchParams.get('organization_id')
         if (!organization_id) return json({ error: 'organization_id é obrigatório' }, 400)
         // top-up idempotente das séries ativas ao abrir a tela
-        const { data: activeSeries } = await supabase.from('recurring_reservations').select('*').eq('organization_id', organization_id).eq('status', 'ACTIVE')
+        const { data: activeSeries } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('organization_id', organization_id).eq('status', 'ACTIVE')
         for (const s of (activeSeries || [])) { try { await topUpSeries(supabase, s, user.id) } catch (e) { console.error('topup', e?.message) } }
         const status = url.searchParams.get('status')
-        let q = supabase.from('recurring_reservations').select('*, customer:customers(id,name,phone), court:courts(id,name), arena:arenas(id,name)').eq('organization_id', organization_id).order('created_at', { ascending: false })
+        let q = supabase.from('recurring_reservations').select(`${RECURRING_SERIES_COLUMNS}, customer:customers(id,name,phone), court:courts(id,name), arena:arenas(id,name)`).eq('organization_id', organization_id).order('created_at', { ascending: false })
         if (status) q = q.eq('status', status)
         const { data, error } = await q
         if (error) throw error
@@ -797,7 +799,7 @@ async function handleRoute(request, { params }) {
 
       // GET /recurring-reservations/:id  -> detalhe + próximas ocorrências
       if (method === 'GET' && id) {
-        const { data: series } = await supabase.from('recurring_reservations').select('*, customer:customers(id,name,phone), court:courts(id,name), arena:arenas(id,name)').eq('id', id).maybeSingle()
+        const { data: series } = await supabase.from('recurring_reservations').select(`${RECURRING_SERIES_COLUMNS}, customer:customers(id,name,phone), court:courts(id,name), arena:arenas(id,name)`).eq('id', id).maybeSingle()
         if (!series) return json({ error: 'Mensalista não encontrado' }, 404)
         try { await topUpSeries(supabase, series, user.id) } catch {}
         const nowISO = new Date().toISOString()
@@ -811,7 +813,7 @@ async function handleRoute(request, { params }) {
         const patch = {}
         // customer_id da série é imutável no banco (A2); mudança estrutural só via "Esta e as próximas".
         ;['notes', 'default_price', 'end_date', 'has_no_end_date'].forEach((k) => { if (body[k] !== undefined) patch[k] = body[k] })
-        const { data: series, error } = await supabase.from('recurring_reservations').update(patch).eq('id', id).select().maybeSingle()
+        const { data: series, error } = await supabase.from('recurring_reservations').update(patch).eq('id', id).select(RECURRING_SERIES_COLUMNS).maybeSingle()
         if (error || !series) return json({ error: 'Sem permissão para editar mensalista' }, 403)
         try { await topUpSeries(supabase, series, user.id) } catch {}
         await supabase.from('audit_logs').insert({ organization_id: series.organization_id, user_id: user.id, action: 'RECURRING_RESERVATION_UPDATED', entity_type: 'recurring_reservation', entity_id: id })
@@ -821,7 +823,7 @@ async function handleRoute(request, { params }) {
       // POST /recurring-reservations/:id/pause  {cancel_future}
       if (method === 'POST' && id && sub === 'pause') {
         const body = await readBody(request)
-        const { data: series, error } = await supabase.from('recurring_reservations').update({ status: 'PAUSED' }).eq('id', id).select().maybeSingle()
+        const { data: series, error } = await supabase.from('recurring_reservations').update({ status: 'PAUSED' }).eq('id', id).select(RECURRING_SERIES_COLUMNS).maybeSingle()
         if (error || !series) return json({ error: 'Sem permissão' }, 403)
         let cancelled = 0
         if (body.cancel_future) cancelled = await cancelFutureOccurrences(supabase, id)
@@ -831,7 +833,7 @@ async function handleRoute(request, { params }) {
 
       // POST /recurring-reservations/:id/reactivate
       if (method === 'POST' && id && sub === 'reactivate') {
-        const { data: series, error } = await supabase.from('recurring_reservations').update({ status: 'ACTIVE' }).eq('id', id).select().maybeSingle()
+        const { data: series, error } = await supabase.from('recurring_reservations').update({ status: 'ACTIVE' }).eq('id', id).select(RECURRING_SERIES_COLUMNS).maybeSingle()
         if (error || !series) return json({ error: 'Sem permissão' }, 403)
         const mat = await topUpSeries(supabase, series, user.id)
         await supabase.from('audit_logs').insert({ organization_id: series.organization_id, user_id: user.id, action: 'RECURRING_RESERVATION_REACTIVATED', entity_type: 'recurring_reservation', entity_id: id, metadata: { created: (mat.created || []).length } })
@@ -840,7 +842,7 @@ async function handleRoute(request, { params }) {
 
       // POST /recurring-reservations/:id/cancel
       if (method === 'POST' && id && sub === 'cancel') {
-        const { data: series, error } = await supabase.from('recurring_reservations').update({ status: 'CANCELLED' }).eq('id', id).select().maybeSingle()
+        const { data: series, error } = await supabase.from('recurring_reservations').update({ status: 'CANCELLED' }).eq('id', id).select(RECURRING_SERIES_COLUMNS).maybeSingle()
         if (error || !series) return json({ error: 'Sem permissão' }, 403)
         const cancelled = await cancelFutureOccurrences(supabase, id)
         await supabase.from('audit_logs').insert({ organization_id: series.organization_id, user_id: user.id, action: 'RECURRING_RESERVATION_CANCELLED', entity_type: 'recurring_reservation', entity_id: id, metadata: { cancelled_future: cancelled } })
@@ -849,7 +851,7 @@ async function handleRoute(request, { params }) {
 
       // POST /recurring-reservations/:id/generate  -> botão "Gerar próximas"
       if (method === 'POST' && id && sub === 'generate') {
-        const { data: series } = await supabase.from('recurring_reservations').select('*').eq('id', id).maybeSingle()
+        const { data: series } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('id', id).maybeSingle()
         if (!series) return json({ error: 'Mensalista não encontrado' }, 404)
         if (series.status !== 'ACTIVE') return json({ error: 'A série precisa estar ativa para gerar novas reservas' }, 400)
         const today = todayInTZ()
@@ -867,7 +869,7 @@ async function handleRoute(request, { params }) {
         const body = await readBody(request)
         const from_date = body.from_date
         if (!from_date) return json({ error: 'from_date é obrigatório' }, 400)
-        const { data: old } = await supabase.from('recurring_reservations').select('*').eq('id', id).maybeSingle()
+        const { data: old } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('id', id).maybeSingle()
         if (!old) return json({ error: 'Mensalista não encontrado' }, 404)
         // 1) Permissão ANTES de qualquer alteração (RECEPTIONIST -> 403, nada é tocado).
         if (!(await canManageOrg(supabase, user.id, old.organization_id))) return json({ error: 'Sem permissão para reagendar mensalista' }, 403)
@@ -903,7 +905,7 @@ async function handleRoute(request, { params }) {
           frequency: next.frequency, weekday: next.weekday, day_of_month: next.day_of_month,
           start_time: next.start_time, end_time: next.end_time, start_date: next.start_date, end_date: next.end_date,
           has_no_end_date: next.has_no_end_date, default_price: next.default_price, notes: next.notes, is_demo: old.is_demo, created_by: user.id, status: 'ACTIVE',
-        }).select().maybeSingle()
+        }).select(RECURRING_SERIES_COLUMNS).maybeSingle()
         if (sErr || !series) {
           const { error: revertErr } = await supabase.from('recurring_reservations').update({ status: old.status, end_date: old.end_date, has_no_end_date: old.has_no_end_date }).eq('id', id)
           if (revertErr) console.error('reschedule revert failed', id, revertErr.message)
