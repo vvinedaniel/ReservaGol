@@ -5,7 +5,8 @@ import { useMe } from '@/components/reserva/dashboard-shell'
 import { createClient } from '@/lib/supabase/browser'
 import { EmptyState } from '@/components/reserva/empty-state'
 import { STATUS_META, RESERVATION_STATUSES, SOURCES, BLOCK_REASONS, statusMeta } from '@/lib/reserva/status'
-import { buildSlots, overlaps, fmtTime, fmtDateLong, fmtDateTimeLong, todayStr, addDaysStr, weekdayOf } from '@/lib/reserva/time'
+import { buildSlots, overlaps, fmtTime, fmtDateLong, fmtDateTimeLong, todayStr, addDaysStr, weekdayOf, timeToMin, closeTimeToMin } from '@/lib/reserva/time'
+import { isManagerOrAbove } from '@/lib/auth/permissions'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -22,6 +23,7 @@ import { cn } from '@/lib/utils'
 export default function AgendaPage() {
   const me = useMe()
   const orgId = me?.activeOrg?.id
+  const canManageSeries = isManagerOrAbove(me?.role)
   const supabase = createClient()
   const [arenas, setArenas] = useState([])
   const [arenaId, setArenaId] = useState('')
@@ -178,7 +180,7 @@ export default function AgendaPage() {
 
       {dlg && <ReservationDialog open={!!dlg} onClose={() => setDlg(null)} orgId={orgId} arenaId={arenaId} date={date} courts={view === 'week' ? (week?.courts || courts) : courts} initial={dlg} onSaved={() => reloadRef.current()} />}
       {blockDlg && <BlockDialog open={!!blockDlg} onClose={() => setBlockDlg(null)} orgId={orgId} arenaId={arenaId} date={date} courts={view === 'week' ? (week?.courts || courts) : courts} initial={blockDlg} onSaved={() => reloadRef.current()} />}
-      {detail && <DetailSheet res={detail} courts={view === 'week' ? (week?.courts || courts) : courts} onClose={() => setDetail(null)} onChanged={() => reloadRef.current()} onEdit={(r) => { setDetail(null); setDlg({ edit: r, court_id: r.court_id, date: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date(r.start_at)), start: fmtTime(r.start_at), end: fmtTime(r.end_at) }) }} />}
+      {detail && <DetailSheet res={detail} canManageSeries={canManageSeries} courts={view === 'week' ? (week?.courts || courts) : courts} onClose={() => setDetail(null)} onChanged={() => reloadRef.current()} onEdit={(r) => { setDetail(null); setDlg({ edit: r, court_id: r.court_id, date: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date(r.start_at)), start: fmtTime(r.start_at), end: fmtTime(r.end_at) }) }} />}
     </div>
   )
 }
@@ -362,7 +364,7 @@ function BlockDialog({ open, onClose, orgId, arenaId, date, courts, initial, onS
   )
 }
 
-function DetailSheet({ res, courts, onClose, onEdit, onChanged }) {
+function DetailSheet({ res, courts, canManageSeries, onClose, onEdit, onChanged }) {
   const m = statusMeta(res.status)
   const [cancelling, setCancelling] = useState(false)
   const [reason, setReason] = useState('')
@@ -402,7 +404,7 @@ function DetailSheet({ res, courts, onClose, onEdit, onChanged }) {
                 <p className="text-xs font-medium text-muted-foreground">Editar</p>
                 <div className="grid grid-cols-1 gap-2">
                   <Button variant="outline" className="w-full justify-start" onClick={() => onEdit(res)}><Pencil className="mr-2 h-4 w-4" /> Apenas esta reserva</Button>
-                  <Button variant="outline" className="w-full justify-start" onClick={() => setReschedule(true)}><Repeat className="mr-2 h-4 w-4" /> Esta e as próximas</Button>
+                  {canManageSeries && <Button variant="outline" className="w-full justify-start" onClick={() => setReschedule(true)}><Repeat className="mr-2 h-4 w-4" /> Esta e as próximas</Button>}
                 </div>
               </div>
             )}
@@ -421,7 +423,7 @@ function DetailSheet({ res, courts, onClose, onEdit, onChanged }) {
           </div>
         )}
       </SheetContent>
-      {reschedule && <RescheduleDialog res={res} courts={courts} onClose={() => setReschedule(false)} onDone={() => { setReschedule(false); onClose(); onChanged() }} />}
+      {reschedule && canManageSeries && <RescheduleDialog res={res} courts={courts} onClose={() => setReschedule(false)} onDone={() => { setReschedule(false); onClose(); onChanged() }} />}
     </Sheet>
   )
 }
@@ -499,15 +501,14 @@ function WeekView({ week, loading, weekCourt, setWeekCourt, onNew, onOpen }) {
   if (!courts.length) return <EmptyState icon={CalendarDays} title="Nenhuma quadra ativa" description="Cadastre e ative quadras para usar a agenda." />
   const active = (weekCourt && courts.find((c) => c.id === weekCourt)) ? weekCourt : courts[0].id
   const days = week.days || []
-  const pm = (t) => { const [h, m] = (t || '0:0').split(':').map(Number); return h * 60 + (m || 0) }
   const hhmm = (min) => `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`
   let minO = Infinity, maxC = -Infinity
-  for (const d of days) { const bh = d.business_hours; if (bh && !bh.closed) { minO = Math.min(minO, pm(bh.open_time)); maxC = Math.max(maxC, pm(bh.close_time)) } }
+  for (const d of days) { const bh = d.business_hours; if (bh && !bh.closed) { minO = Math.min(minO, timeToMin(bh.open_time)); maxC = Math.max(maxC, closeTimeToMin(bh.close_time)) } }
   const slots = maxC > minO ? buildSlots(hhmm(minO), hhmm(maxC), week.step) : []
   const wlabel = (ds) => new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', weekday: 'short' }).format(new Date(`${ds}T12:00:00-03:00`)).replace('.', '')
   const cellFor = (d, s) => {
     const bh = d.business_hours
-    const open = bh && !bh.closed && s.startMin >= pm(bh.open_time) && s.endMin <= pm(bh.close_time)
+    const open = bh && !bh.closed && s.startMin >= timeToMin(bh.open_time) && s.endMin <= closeTimeToMin(bh.close_time)
     if (!open) return { closed: true }
     const res = (d.reservations || []).find((r) => r.court_id === active && overlaps(r, s.startMin, s.endMin))
     return { res }

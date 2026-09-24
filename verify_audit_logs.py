@@ -7,7 +7,7 @@ import os
 import requests
 import json
 
-SUPABASE_URL = "https://khidbemtqybkbywrpllx.supabase.co"
+SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
 
 # Organization ID from the last test run

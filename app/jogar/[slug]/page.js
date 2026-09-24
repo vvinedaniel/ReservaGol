@@ -10,7 +10,7 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { MapPin, MessageCircle, Navigation, Goal, Loader2, CheckCircle2, Clock } from 'lucide-react'
 import { toast } from 'sonner'
-import { todayStr, addDaysStr, weekdayOf, fmtDateLong } from '@/lib/reserva/time'
+import { todayStr, addDaysStr, weekdayOf, fmtDateLong, minsOfDay, isWithinHours } from '@/lib/reserva/time'
 
 export default function ArenaPublicPage() {
   const { slug } = useParams()
@@ -32,9 +32,7 @@ export default function ArenaPublicPage() {
   const openNow = useMemo(() => {
     if (!arena?.business_hours) return null
     const wd = weekdayOf(todayStr()); const h = arena.business_hours.find((x) => x.weekday === wd)
-    if (!h || h.closed) return false
-    const now = new Intl.DateTimeFormat('en-GB', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date())
-    return now >= (h.open_time || '').slice(0, 5) && now < (h.close_time || '').slice(0, 5)
+    return isWithinHours(h, minsOfDay(new Date().toISOString()))
   }, [arena])
 
   if (notFound) return <div className="flex min-h-screen items-center justify-center p-6 text-center"><div><Goal className="mx-auto h-10 w-10 text-muted-foreground" /><p className="mt-3 font-display text-lg font-semibold">Arena não disponível</p><p className="text-sm text-muted-foreground">Esta arena não está publicada.</p></div></div>

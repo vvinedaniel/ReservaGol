@@ -164,8 +164,8 @@ def main():
     
     try:
         # Try using existing test users from test_result.md
-        email_a = "agenda.test@reservagol.test"
-        password = "ReservaGol123"
+        email_a = os.environ['TEST_ACCOUNT_EMAIL']
+        password = os.environ['TEST_ACCOUNT_PASSWORD']  # sem fallback: definir no ambiente
         
         log(f"Attempting to use existing user: {email_a}")
         try:

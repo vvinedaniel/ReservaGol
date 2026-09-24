@@ -841,9 +841,9 @@ agent_communication:
       Quadras and Configurações.
       IMPORTANT for auth (avoid Supabase signup 429 rate limit): use these PRE-CREATED accounts
       (email confirmation disabled, no org yet -> they will go through onboarding):
-        - ui1@reservagol.test / ReservaGol123
-        - ui2@reservagol.test / ReservaGol123
-        - gestor.demo@reservagol.test / ReservaGol123
+        - ui1@reservagol.test / <TEST_ACCOUNT_PASSWORD>
+        - ui2@reservagol.test / <TEST_ACCOUNT_PASSWORD>
+        - gestor.demo@reservagol.test / <TEST_ACCOUNT_PASSWORD>
       Do NOT create many new signups. You may verify the /register form renders + client validation, but
       use the accounts above for the authenticated flows. NOTE: this is Next.js DEV mode, first navigation
       to a route compiles on-demand (can take 5-20s) -> use generous timeouts (60s) on first navigations.
@@ -1065,7 +1065,7 @@ agent_communication:
     -agent: "main"
     -message: |
       PHASE 02A FRONTEND TESTING AUTHORIZED (desktop 1920 + mobile 390 + Realtime). Realtime publication on
-      public.reservations is now ENABLED. Use pre-created account ui1@reservagol.test / ReservaGol123 (has an
+      public.reservations is now ENABLED. Use pre-created account ui1@reservagol.test / <TEST_ACCOUNT_PASSWORD> (has an
       organization with courts). If it lands on /onboarding, complete onboarding first. DEV mode: use generous
       timeouts (60s) on first navigations. Validate: sidebar Agenda/Reservas are active (no "Em breve"); Agenda
       day grid (courts as columns, time rows from business hours), create reservation by clicking a free slot,
@@ -1146,7 +1146,7 @@ agent_communication:
       closed day) -> agenda correctly showed "Arena fechada". Confirmed the /api/agenda code is correct
       (returns open grid for a properly configured arena).
       USE THIS ACCOUNT (already onboarded, ALL days open 08:00-23:00, 2 courts Society 01 + Futsal 01, 60 min):
-        agenda.test@reservagol.test / ReservaGol123  (org "Arena Teste Agenda", "Unidade Central")
+        agenda.test@reservagol.test / <TEST_ACCOUNT_PASSWORD>  (org "Arena Teste Agenda", "Unidade Central")
       No onboarding needed. "Today" is Sep 2026 in this environment and all weekdays are OPEN, so the grid will
       render. Proceed with the full Phase 02A test (agenda create/conflict/edit/cancel/block, details sheet,
       Reservas page filters/search, dashboard Hoje na Arena + occupancy, mobile 390 timeline, and REALTIME with
@@ -1186,7 +1186,7 @@ agent_communication:
     -agent: "main"
     -message: |
       PHASE 02A CLOSING - WEEKLY AGENDA VIEW added (day view unchanged). Test with agenda.test@reservagol.test
-      / ReservaGol123 (org with 2 courts, all days OPEN 08:00-23:00). Validate the new DIA|SEMANA toggle on
+      / <TEST_ACCOUNT_PASSWORD> (org with 2 courts, all days OPEN 08:00-23:00). Validate the new DIA|SEMANA toggle on
       /dashboard/agenda. Focus: week view (Mon-Sun), respects business hours (closed cells shown as "—"/
       "Fechado"), shows reservations + blocks with status, open details, create reservation on a free slot in
       week appears on the CORRECT day, respects selected court (court picker when >1). Desktop 1920: 7-day grid
@@ -1444,7 +1444,7 @@ agent_communication:
       ✅ Broken/missing images have graceful fallback (Goal icon placeholder)
       
       **TEST METHODOLOGY:**
-      - Used existing account: agenda.test@reservagol.test / ReservaGol123
+      - Used existing account: agenda.test@reservagol.test / <TEST_ACCOUNT_PASSWORD>
       - Published arena: "Unidade Central" with slug "arena-teste-agenda"
       - Unpublished arena: "Consolação" with slug "arena-unpublished-test"
       - Created 3 public reservations via booking flow (Ana Costa Teste, Pedro Oliveira Teste, Maria Santos Teste)
