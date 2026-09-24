@@ -47,6 +47,11 @@ const CONFLICT_MSG = 'Este horário acabou de ficar indisponível. Escolha outro
 function normalizePhone(p) { return (p || '').replace(/\D/g, '') }
 function toISO(date, time) { return `${date}T${(time || '').slice(0, 5)}:00${ARENA_OFFSET}` }
 function todayInTZ() { return new Intl.DateTimeFormat('en-CA', { timeZone: ARENA_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()) }
+// Violação de integridade multi-tenant (triggers A2): RGT01 = vínculo com outra
+// organização/arena; RGT02 = alteração de vínculo estrutural imutável.
+// Mensagem genérica: nunca revela IDs, nomes ou dados de outra organização.
+const TENANT_MSG = 'Dados da reserva não pertencem à mesma organização.'
+function isTenantViolation(error) { return !!error && (error.code === 'RGT01' || error.code === 'RGT02') }
 function isConflict(error) {
   const m = (error && (error.message || error.details || '')) + ''
   return !!error && (error.code === '23P01' || m.includes('no_overlap') || m.toLowerCase().includes('overlap') || m.includes('exclusion'))
@@ -536,6 +541,7 @@ async function handleRoute(request, { params }) {
           description: body.description || null,
           active: body.active !== false,
         }).select('*, arena:arenas(id,name)').maybeSingle()
+        if (isTenantViolation(error)) return json({ error: 'A arena informada não pertence à mesma organização.' }, 400)
         if (error) return json({ error: 'Sem permissão para criar quadra' }, 403)
         await supabase.from('audit_logs').insert({ organization_id: body.organization_id, user_id: user.id, action: 'COURT_CREATED', entity_type: 'court', entity_id: data?.id })
         return json(data, 201)
@@ -545,6 +551,7 @@ async function handleRoute(request, { params }) {
         const patch = {}
         ;['name','type','description','active'].forEach((k) => { if (body[k] !== undefined) patch[k] = body[k] })
         const { data, error } = await supabase.from('courts').update(patch).eq('id', id).select('*, arena:arenas(id,name)').maybeSingle()
+        if (isTenantViolation(error)) return json({ error: 'A arena informada não pertence à mesma organização.' }, 400)
         if (error) return json({ error: 'Sem permissão ou dados inválidos' }, 403)
         await supabase.from('audit_logs').insert({ organization_id: data?.organization_id, user_id: user.id, action: 'COURT_UPDATED', entity_type: 'court', entity_id: id })
         return json(data)
@@ -570,6 +577,7 @@ async function handleRoute(request, { params }) {
           closed: !!h.closed,
         }))
         const { data, error } = await supabase.from('business_hours').upsert(rows, { onConflict: 'arena_id,weekday' }).select()
+        if (isTenantViolation(error)) return json({ error: 'A arena informada não pertence à mesma organização.' }, 400)
         if (error) return json({ error: 'Sem permissão ou dados inválidos' }, 403)
         return json(data || [])
       }
@@ -592,6 +600,7 @@ async function handleRoute(request, { params }) {
       if (method === 'POST') {
         const body = await readBody(request)
         const { data, error } = await supabase.from('customers').insert({ organization_id: body.organization_id, arena_id: body.arena_id || null, name: body.name, phone: normalizePhone(body.phone) || null, email: body.email || null }).select().maybeSingle()
+        if (isTenantViolation(error)) return json({ error: 'A arena informada não pertence à mesma organização.' }, 400)
         if (error) return json({ error: 'Não foi possível salvar o cliente' }, 403)
         return json(data, 201)
       }
@@ -633,6 +642,7 @@ async function handleRoute(request, { params }) {
           start_at: toISO(body.date, body.start_time), end_at: endISO(body.date, body.start_time, body.end_time),
           status: 'BLOCKED', source: 'INTERNAL', notes: body.reason || 'Bloqueio', created_by: user.id,
         }).select().maybeSingle()
+        if (isTenantViolation(error)) return json({ error: TENANT_MSG }, 400)
         if (error) return json({ error: isConflict(error) ? CONFLICT_MSG : 'Não foi possível bloquear o horário' }, isConflict(error) ? 409 : 400)
         await supabase.from('audit_logs').insert({ organization_id: body.organization_id, user_id: user.id, action: 'TIME_BLOCK_CREATED', entity_type: 'reservation', entity_id: data?.id, metadata: { reason: body.reason || null } })
         return json(data, 201)
@@ -665,6 +675,7 @@ async function handleRoute(request, { params }) {
         // Editar "apenas esta" ocorrência de uma série marca exceção (mantém vínculo p/ histórico).
         if (before?.recurring_reservation_id) patch.is_exception = true
         const { data, error } = await supabase.from('reservations').update(patch).eq('id', id).select('*, customer:customers(id,name,phone), court:courts(id,name)').maybeSingle()
+        if (isTenantViolation(error)) return json({ error: TENANT_MSG }, 400)
         if (error) return json({ error: isConflict(error) ? CONFLICT_MSG : 'Não foi possível salvar a reserva' }, isConflict(error) ? 409 : 400)
         const updAction = before?.recurring_reservation_id ? 'RECURRING_OCCURRENCE_UPDATED' : 'RESERVATION_UPDATED'
         await supabase.from('audit_logs').insert({ organization_id: data?.organization_id, user_id: user.id, action: updAction, entity_type: 'reservation', entity_id: id, metadata: { recurring_reservation_id: before?.recurring_reservation_id || null } })
@@ -681,6 +692,7 @@ async function handleRoute(request, { params }) {
           start_at: toISO(body.date, body.start_time), end_at: endISO(body.date, body.start_time, body.end_time),
           status: body.status || 'CONFIRMED', source: body.source || 'RECEPÇÃO', notes: body.notes || null, created_by: user.id,
         }).select('*, customer:customers(id,name,phone), court:courts(id,name)').maybeSingle()
+        if (isTenantViolation(error)) return json({ error: TENANT_MSG }, 400)
         if (error) return json({ error: isConflict(error) ? CONFLICT_MSG : 'Não foi possível criar a reserva' }, isConflict(error) ? 409 : 400)
         await supabase.from('audit_logs').insert({ organization_id: body.organization_id, user_id: user.id, action: 'RESERVATION_CREATED', entity_type: 'reservation', entity_id: data?.id })
         return json(data, 201)
@@ -797,7 +809,8 @@ async function handleRoute(request, { params }) {
       if (method === 'PATCH' && id) {
         const body = await readBody(request)
         const patch = {}
-        ;['notes', 'default_price', 'end_date', 'has_no_end_date', 'customer_id'].forEach((k) => { if (body[k] !== undefined) patch[k] = body[k] })
+        // customer_id da série é imutável no banco (A2); mudança estrutural só via "Esta e as próximas".
+        ;['notes', 'default_price', 'end_date', 'has_no_end_date'].forEach((k) => { if (body[k] !== undefined) patch[k] = body[k] })
         const { data: series, error } = await supabase.from('recurring_reservations').update(patch).eq('id', id).select().maybeSingle()
         if (error || !series) return json({ error: 'Sem permissão para editar mensalista' }, 403)
         try { await topUpSeries(supabase, series, user.id) } catch {}
