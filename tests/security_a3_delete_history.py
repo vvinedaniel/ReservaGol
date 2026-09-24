@@ -21,6 +21,7 @@ Opcional: TEST_EMAIL_DOMAIN (padrão reservagol.test)
 
 Uso: python tests/security_a3_delete_history.py
 """
+import atexit
 import json
 import os
 import sys
@@ -28,6 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from harness_cleanup import FixtureTracker
 from datetime import datetime, timedelta, timezone
 
 REQUIRED = ['BASE_URL', 'SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY', 'SUPABASE_SECRET_KEY', 'TEST_ACCOUNT_PASSWORD']
@@ -46,6 +48,9 @@ SP = timezone(timedelta(hours=-3))
 RUN = uuid.uuid4().hex[:8]
 SVC = {'apikey': SECRET, 'Authorization': f'Bearer {SECRET}'}
 results = {}
+# Limpeza verificável (created/cleaned/residual): só o que ESTA execução criou.
+FX = FixtureTracker(SB, SECRET)
+atexit.register(FX.cleanup)
 
 
 def http(method, url, headers=None, body=None):
@@ -85,6 +90,7 @@ def create_user(label):
     email = f'a3-{label}-{RUN}@{DOMAIN}'
     s, b, raw = http('POST', f'{SB}/auth/v1/admin/users', SVC, {'email': email, 'password': PASSWORD, 'email_confirm': True})
     assert s in (200, 201), f'criar usuário {s} {raw[:200]}'
+    FX.user(b['id'])
     s, t, raw = http('POST', f'{SB}/auth/v1/token?grant_type=password', {'apikey': PUB_KEY}, {'email': email, 'password': PASSWORD})
     assert s == 200, f'login {s} {raw[:200]}'
     return b['id'], t['access_token']
@@ -126,7 +132,7 @@ s, b, raw = api('POST', '/onboarding', TO, {
     'default_reservation_minutes': 60,
 })
 assert s == 200, f'onboarding {s} {raw[:200]}'
-ORG = b['organization_id']
+ORG = FX.org(b['organization_id'], f'A3 Org {RUN}')
 for uid, role in ((UM, 'MANAGER'), (UR, 'RECEPTIONIST')):
     s, _, raw = svc('POST', 'organization_members', {'organization_id': ORG, 'user_id': uid, 'role': role, 'status': 'ACTIVE'})
     assert s == 201, f'membro {role} {s} {raw[:160]}'
@@ -142,7 +148,8 @@ s, res, raw = api('POST', '/reservations', TO, {'organization_id': ORG, 'arena_i
 assert s == 201, f'reserva {s} {raw[:160]}'
 RES = res['id']
 s, ser, raw = api('POST', '/recurring-reservations', TO, {'organization_id': ORG, 'arena_id': ARENA, 'court_id': C2, 'frequency': 'WEEKLY', 'weekday': D.isoweekday() % 7,
-                                                         'start_time': '19:00', 'end_time': '20:00', 'start_date': str(D), 'has_no_end_date': True, 'customer_id': CUST})
+                                                         'start_time': '19:00', 'end_time': '20:00', 'start_date': str(D), 'has_no_end_date': True, 'customer_id': CUST,
+                                                         'operation_id': str(uuid.uuid4())})
 assert s == 201 and ser['created'] > 0, f'série {s} {raw[:160]}'
 SERIES = ser['id']
 s, occ, _ = svc('GET', 'reservations', query=f'?recurring_reservation_id=eq.{SERIES}&select=id&order=occurrence_date.asc')
@@ -338,7 +345,7 @@ def m5_setup():
     M5['users'] = [u1, u2]
     s, b, raw = svc('POST', 'organizations', {'name': f'A3 M5 {RUN}', 'is_demo': True, 'onboarding_completed': True})
     assert s == 201, f'org M5 {s} {raw[:160]}'
-    M5['org'] = b[0]['id']
+    M5['org'] = FX.org(b[0]['id'], f'A3 M5 {RUN}')
     for uid in (u1, u2):
         s, _, raw = svc('POST', 'organization_members', {'organization_id': M5['org'], 'user_id': uid, 'role': 'OWNER', 'status': 'ACTIVE'})
         assert s == 201, f'OWNER M5 {s} {raw[:160]}'
@@ -397,7 +404,7 @@ def n1():
     try:
         s, b, raw = svc('POST', 'organizations', {'name': f'A3 Cascade {RUN}', 'is_demo': True, 'onboarding_completed': True})
         assert s == 201, f'org efêmera {s} {raw[:160]}'
-        oid = b[0]['id']
+        oid = FX.org(b[0]['id'], f'A3 Cascade {RUN}')
         s, b, raw = svc('POST', 'organization_members', {'organization_id': oid, 'user_id': uid, 'role': 'OWNER', 'status': 'ACTIVE'})
         assert s == 201, f'OWNER único {s} {raw[:160]}'
         mid = b[0]['id']
@@ -434,4 +441,5 @@ m5_cleanup()
 
 ok = sum(1 for v in results.values() if v == 'PASS')
 print(f'\n== {ok}/{len(results)} PASS (run {RUN}, org {ORG}) ==')
-sys.exit(0 if ok == len(results) else 1)
+residual = FX.cleanup()
+sys.exit(0 if ok == len(results) and residual == 0 else 1)
