@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Next.js / build
+.next/
+out/
+dist/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Emergent local files
+.emergent/
+.screenshots/
+memory/
+test_reports/
+
+# Other generated files
+coverage/
+.vercel/
+.DS_Store
+node_modules/@next/swc-linux-arm64-gnu/next-swc.linux-arm64-gnu.node
+node_modules/@next/swc-linux-arm64-musl/next-swc.linux-arm64-musl.node
