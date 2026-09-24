@@ -43,7 +43,7 @@ export default function PublicReservationPage() {
           {cancelled ? <XCircle className="h-14 w-14 text-destructive" /> : <CheckCircle2 className="h-14 w-14 text-primary" />}
           <h1 className="mt-4 font-display text-2xl font-bold">{cancelled ? 'Reserva cancelada' : 'Reserva confirmada!'}</h1>
           <p className="mt-1 text-sm text-muted-foreground">Código da reserva</p>
-          <p className="mt-2 rounded-lg border border-primary/30 bg-primary/10 px-4 py-2 font-display text-2xl font-bold tracking-widest text-primary">{res.public_code}</p>
+          <p className="mt-2 rounded-lg border border-primary/30 bg-primary/10 px-4 py-2 max-w-full break-all font-display text-lg font-bold tracking-widest text-primary sm:text-2xl">{res.public_code}</p>
         </div>
 
         <div className="mt-6 rounded-xl border border-border bg-card p-4 text-sm">
