@@ -3,6 +3,7 @@ import { createClient as createTokenClient } from '@supabase/supabase-js'
 import { createClient } from '@/lib/supabase/server'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { timeToMin, closeTimeToMin, crossesMidnight, intervalEndMin, buildSlots, overlaps } from '@/lib/reserva/time'
+import { RATE_LIMITS, clientIp, consumeRateLimit } from '@/lib/reserva/rate-limit'
 import { PUBLIC_ERRORS, isUuid, isValidSlug, isHHMM, isRealDate, checkPublicDate, safeSlotMinutes, publicSlots, findSlot, slotStarted, cleanName, cleanBrPhone, cleanEmail, cleanIdempotencyKey } from '@/lib/reserva/public-booking'
 
 function json(data, status = 200) {
@@ -938,13 +939,22 @@ export const PATCH = handleRoute
 export const DELETE = handleRoute
 
 // ============================ PHASE 02B: PUBLIC API ============================
-const RL = new Map()
-function rateLimited(key) { const now = Date.now(); const arr = (RL.get(key) || []).filter((t) => now - t < 60000); arr.push(now); RL.set(key, arr); return arr.length > 12 }
 // Resposta pública que nunca deve ser guardada em cache (navegador, proxy ou CDN).
 function jsonNoStore(data, status = 200) {
   const res = json(data, status)
   res.headers.set('Cache-Control', 'no-store')
   return res
+}
+// A6: respostas do rate limit persistente (sem scope, contagem, hash, telefone ou IP).
+function tooManyRequests(retryAfter) {
+  const res = jsonNoStore({ error: 'Muitas tentativas. Aguarde alguns minutos e tente novamente.' }, 429)
+  res.headers.set('Retry-After', String(retryAfter))
+  return res
+}
+// Limiter indisponível (RPC/secret/resposta inválida): NUNCA fail-open.
+function limiterUnavailable(where, err) {
+  console.error(`Rate limiter indisponível (${where}):`, err?.message || 'sem identificador utilizável')
+  return jsonNoStore({ error: 'Serviço temporariamente indisponível. Tente novamente em instantes.' }, 503)
 }
 function genCode() { const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; for (let i = 0; i < 6; i++) s += a[Math.floor(Math.random() * a.length)]; return 'RG-' + s }
 
@@ -1010,8 +1020,6 @@ async function handlePublic(request, id, sub, method) {
     if (id === 'reserve' && method === 'POST') {
       const raw = await readBody(request)
       const body = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
-      const ip = request.headers.get('x-forwarded-for') || 'ip'
-      if (rateLimited(`${ip}:${normalizePhone(typeof body.phone === 'string' ? body.phone : '')}`)) return json({ error: 'Muitas tentativas. Aguarde um instante e tente novamente.' }, 429)
       // 1) Formato de TODOS os campos, sem consultar o banco (A4). Nada é criado se falhar.
       if (!isValidSlug(body.slug) || !isUuid(body.court_id) || !isHHMM(body.start_time) || !isHHMM(body.end_time)) return json({ error: PUBLIC_ERRORS.params }, 400)
       if (!isRealDate(body.date)) return json({ error: PUBLIC_ERRORS.date }, 400)
@@ -1045,6 +1053,18 @@ async function handlePublic(request, id, sub, method) {
       const slot = findSlot(publicSlots(bh, minutes), body.start_time, body.end_time) // par EXATO, nunca só a duração
       if (!slot) return json({ error: PUBLIC_ERRORS.slot }, 400)
       if (slotStarted(body.date, slot.start, Date.now())) return json({ error: PUBLIC_ERRORS.slotPast }, 400)
+      // A6: só tentativas NOVAS e VÁLIDAS consomem quota (retry idempotente já retornou acima).
+      // Primário: arena + telefone. Secundário: arena + IP (quando houver IP utilizável).
+      // Os dois buckets são consumidos (tentativa real); qualquer um bloqueado -> 429.
+      try {
+        const ip = clientIp(request.headers)
+        const checks = [consumeRateLimit(admin, RATE_LIMITS.RESERVE_PHONE, [a.id, phone])]
+        if (ip) checks.push(consumeRateLimit(admin, RATE_LIMITS.RESERVE_IP, [a.id, ip]))
+        const blocked = (await Promise.all(checks)).filter((r) => !r.allowed)
+        if (blocked.length) return tooManyRequests(Math.max(...blocked.map((r) => r.retryAfter)))
+      } catch (e) {
+        return limiterUnavailable('reserve', e)
+      }
       // 5) Só agora: cliente (dedup por telefone dentro da organização) e reserva.
       //    A constraint reservations_no_overlap continua sendo a autoridade final (409).
       let customer_id = null
@@ -1067,6 +1087,15 @@ async function handlePublic(request, id, sub, method) {
       return json({ public_code }, 201)
     }
     if (id === 'reservation' && sub && method === 'GET') {
+      // A6: rate limit por IP ANTES de qualquer consulta. Sem IP utilizável -> 503 (fail-closed).
+      const lookupIp = clientIp(request.headers)
+      if (!lookupIp) return limiterUnavailable('lookup')
+      try {
+        const rl = await consumeRateLimit(admin, RATE_LIMITS.LOOKUP_IP, [lookupIp])
+        if (!rl.allowed) return tooManyRequests(rl.retryAfter)
+      } catch (e) {
+        return limiterUnavailable('lookup', e)
+      }
       // A5: sem identidade de cliente (o customer_id pode ser um cadastro pré-existente
       // reaproveitado pelo telefone). Só reservas realmente públicas; allowlist explícita;
       // mesmo 404 para código inexistente ou não público; nunca em cache.
