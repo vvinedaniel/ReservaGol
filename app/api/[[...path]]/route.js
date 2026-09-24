@@ -4,6 +4,7 @@ import { createClient } from '@/lib/supabase/server'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { timeToMin, closeTimeToMin, crossesMidnight, intervalEndMin, buildSlots, overlaps } from '@/lib/reserva/time'
 import { RATE_LIMITS, clientIp, consumeRateLimit } from '@/lib/reserva/rate-limit'
+import { insertWithPublicCode } from '@/lib/reserva/public-code'
 import { PUBLIC_ERRORS, isUuid, isValidSlug, isHHMM, isRealDate, checkPublicDate, safeSlotMinutes, publicSlots, findSlot, slotStarted, cleanName, cleanBrPhone, cleanEmail, cleanIdempotencyKey } from '@/lib/reserva/public-booking'
 
 // B1: sem headers CORS — a API só é consumida pelo próprio frontend (mesma origem).
@@ -953,7 +954,6 @@ function limiterUnavailable(where, err) {
   console.error(`Rate limiter indisponível (${where}):`, err?.message || 'sem identificador utilizável')
   return jsonNoStore({ error: 'Serviço temporariamente indisponível. Tente novamente em instantes.' }, 503)
 }
-function genCode() { const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; for (let i = 0; i < 6; i++) s += a[Math.floor(Math.random() * a.length)]; return 'RG-' + s }
 
 async function loadPublicArena(admin, slug) {
   const { data } = await admin.from('arenas').select('*').eq('slug', slug).eq('active', true).eq('public_booking_enabled', true).maybeSingle()
@@ -1068,18 +1068,30 @@ async function handlePublic(request, id, sub, method) {
       const { data: exc } = await admin.from('customers').select('id').eq('organization_id', a.organization_id).eq('phone', phone).limit(1).maybeSingle()
       if (exc) customer_id = exc.id
       else { const { data: nc } = await admin.from('customers').insert({ organization_id: a.organization_id, arena_id: a.id, name, phone, email: email.value }).select('id').maybeSingle(); customer_id = nc?.id || null }
-      const public_code = genCode()
-      const { data: created, error } = await admin.from('reservations').insert({
-        organization_id: a.organization_id, arena_id: a.id, court_id: body.court_id, customer_id,
-        start_at: toISO(body.date, slot.start), end_at: endISO(body.date, slot.start, slot.end),
-        status: 'CONFIRMED', source: 'PUBLIC_WEB', notes: null, public_code, idempotency_key: idem.value,
-      }).select('public_code').maybeSingle()
-      if (error) {
-        if (isConflict(error)) return json({ error: 'Este horário acabou de ser reservado. Escolha outro horário.' }, 409)
-        // Corrida de idempotência: dois cliques quase simultâneos com a mesma chave
-        if (error.code === '23505' && idem.value) { const { data: ex2 } = await admin.from('reservations').select('public_code').eq('arena_id', a.id).eq('idempotency_key', idem.value).maybeSingle(); if (ex2) return json({ public_code: ex2.public_code, idempotent: true }) }
+      // B2: public_code com CSPRNG (80 bits). Em colisão do índice UNIQUE do código, repete SÓ o
+      // INSERT com um código novo (máx. 3 tentativas). Em 23505/23P01, a corrida de idempotência
+      // (mesma arena + idempotency_key) é resolvida ANTES de regenerar ou responder 409.
+      const ins = await insertWithPublicCode({
+        insert: (code) => admin.from('reservations').insert({
+          organization_id: a.organization_id, arena_id: a.id, court_id: body.court_id, customer_id,
+          start_at: toISO(body.date, slot.start), end_at: endISO(body.date, slot.start, slot.end),
+          status: 'CONFIRMED', source: 'PUBLIC_WEB', notes: null, public_code: code, idempotency_key: idem.value,
+        }).select('public_code').maybeSingle(),
+        resolveExisting: idem.value ? async () => {
+          const { data: ex2 } = await admin.from('reservations').select('public_code').eq('arena_id', a.id).eq('idempotency_key', idem.value).maybeSingle()
+          return ex2?.public_code || null
+        } : null,
+      })
+      if (ins.status === 'existing') return json({ public_code: ins.code, idempotent: true })
+      if (ins.status === 'error') {
+        if (isConflict(ins.error)) return json({ error: 'Este horário acabou de ser reservado. Escolha outro horário.' }, 409)
         return json({ error: 'Não foi possível concluir a reserva' }, 400)
       }
+      if (ins.status === 'exhausted') {
+        console.error('Reserva pública: tentativas de public_code esgotadas')
+        return json({ error: 'Não foi possível concluir a reserva. Tente novamente.' }, 500)
+      }
+      const public_code = ins.code
       await admin.from('audit_logs').insert({ organization_id: a.organization_id, user_id: null, action: 'PUBLIC_RESERVATION_CREATED', entity_type: 'reservation', entity_id: null, metadata: { arena_id: a.id, court_id: body.court_id, public_code, source: 'PUBLIC_WEB' } })
       return json({ public_code }, 201)
     }
