@@ -28,11 +28,12 @@ const nextConfig = {
       {
         source: "/(.*)",
         headers: [
-          { key: "X-Frame-Options", value: "ALLOWALL" },
-          { key: "Content-Security-Policy", value: "frame-ancestors *;" },
-          { key: "Access-Control-Allow-Origin", value: process.env.CORS_ORIGINS || "*" },
-          { key: "Access-Control-Allow-Methods", value: "GET, POST, PUT, DELETE, OPTIONS" },
-          { key: "Access-Control-Allow-Headers", value: "*" },
+          // B1: sem framing por terceiros (os dois headers concordam) e sem CORS global —
+          // o frontend chama a API na mesma origem. Não é uma CSP completa (só frame-ancestors).
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "Content-Security-Policy", value: "frame-ancestors 'none';" },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
         ],
       },
     ];
