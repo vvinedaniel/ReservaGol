@@ -3,6 +3,7 @@ import { createClient as createTokenClient } from '@supabase/supabase-js'
 import { createClient } from '@/lib/supabase/server'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { timeToMin, closeTimeToMin, crossesMidnight, intervalEndMin, buildSlots, overlaps } from '@/lib/reserva/time'
+import { PUBLIC_ERRORS, isUuid, isValidSlug, isHHMM, isRealDate, checkPublicDate, safeSlotMinutes, publicSlots, findSlot, slotStarted, cleanName, cleanBrPhone, cleanEmail, cleanIdempotencyKey } from '@/lib/reserva/public-booking'
 
 function json(data, status = 200) {
   const res = NextResponse.json(data, { status })
@@ -979,49 +980,81 @@ async function handlePublic(request, id, sub, method) {
     }
     if (id === 'availability' && method === 'GET') {
       const slug = url.searchParams.get('slug'); const court_id = url.searchParams.get('court_id'); const date = url.searchParams.get('date')
-      if (!slug || !court_id || !date) return json({ error: 'Parâmetros obrigatórios ausentes' }, 400)
+      // Formato validado ANTES de qualquer consulta (A4).
+      if (!isValidSlug(slug) || !isUuid(court_id)) return json({ error: PUBLIC_ERRORS.params }, 400)
+      const dateErr = checkPublicDate(date, todayInTZ())
+      if (dateErr) return json({ error: PUBLIC_ERRORS[dateErr] }, 400)
       const a = await loadPublicArena(admin, slug)
       if (!a) return json({ error: 'Arena indisponível' }, 404)
       const { data: court } = await admin.from('courts').select('id').eq('id', court_id).eq('arena_id', a.id).eq('active', true).maybeSingle()
       if (!court) return json({ error: 'Quadra indisponível' }, 404)
-      const { data: org } = await admin.from('organizations').select('default_reservation_minutes').eq('id', a.organization_id).maybeSingle()
       const weekday = new Date(`${date}T12:00:00${ARENA_OFFSET}`).getUTCDay()
       const { data: bh } = await admin.from('business_hours').select('*').eq('arena_id', a.id).eq('weekday', weekday).maybeSingle()
       if (!bh || bh.closed) return json({ closed: true, slots: [] })
-      const slots = buildSlots(bh.open_time, bh.close_time, org?.default_reservation_minutes || 60) // close 00:00 = meia-noite
+      const { data: org } = await admin.from('organizations').select('default_reservation_minutes').eq('id', a.organization_id).maybeSingle()
+      const minutes = safeSlotMinutes(org?.default_reservation_minutes)
+      if (!minutes) return json({ error: PUBLIC_ERRORS.config }, 503) // configuração inválida: nunca gera slots
+      const slots = publicSlots(bh, minutes) // close 00:00 = meia-noite
       const { data: res } = await admin.from('reservations').select('start_at,end_at,status').eq('court_id', court_id).neq('status', 'CANCELLED').gte('start_at', `${date}T00:00:00${ARENA_OFFSET}`).lte('start_at', `${date}T23:59:59${ARENA_OFFSET}`)
-      const out = slots.map((s) => ({ start: s.start, end: s.end, available: !(res || []).some((r) => overlaps(r, s.startMin, s.endMin)) }))
+      const now = Date.now()
+      // Horário já iniciado (hoje) nunca aparece como disponível.
+      const out = slots.map((s) => ({ start: s.start, end: s.end, available: !slotStarted(date, s.start, now) && !(res || []).some((r) => overlaps(r, s.startMin, s.endMin)) }))
       return json({ closed: false, slots: out })
     }
     if (id === 'reserve' && method === 'POST') {
-      const body = await readBody(request)
+      const raw = await readBody(request)
+      const body = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
       const ip = request.headers.get('x-forwarded-for') || 'ip'
-      if (rateLimited(`${ip}:${normalizePhone(body.phone)}`)) return json({ error: 'Muitas tentativas. Aguarde um instante e tente novamente.' }, 429)
-      if (!body.slug || !body.court_id || !body.date || !body.start_time || !body.end_time || !body.name || !body.phone) return json({ error: 'Dados obrigatórios ausentes' }, 400)
-      if (!body.accept_terms) return json({ error: 'É necessário aceitar as regras da arena.' }, 400)
-      if (sameTime(body.start_time, body.end_time)) return json({ error: SAME_TIME_MSG }, 400)
+      if (rateLimited(`${ip}:${normalizePhone(typeof body.phone === 'string' ? body.phone : '')}`)) return json({ error: 'Muitas tentativas. Aguarde um instante e tente novamente.' }, 429)
+      // 1) Formato de TODOS os campos, sem consultar o banco (A4). Nada é criado se falhar.
+      if (!isValidSlug(body.slug) || !isUuid(body.court_id) || !isHHMM(body.start_time) || !isHHMM(body.end_time)) return json({ error: PUBLIC_ERRORS.params }, 400)
+      if (!isRealDate(body.date)) return json({ error: PUBLIC_ERRORS.date }, 400)
+      const name = cleanName(body.name)
+      if (!name) return json({ error: PUBLIC_ERRORS.name }, 400)
+      const phone = cleanBrPhone(body.phone)
+      if (!phone) return json({ error: PUBLIC_ERRORS.phone }, 400)
+      const email = cleanEmail(body.email)
+      if (!email.ok) return json({ error: PUBLIC_ERRORS.email }, 400)
+      if (body.accept_terms !== true) return json({ error: PUBLIC_ERRORS.terms }, 400) // booleano true estrito
+      const idem = cleanIdempotencyKey(body.idempotency_key)
+      if (!idem.ok) return json({ error: PUBLIC_ERRORS.idempotency }, 400)
+      // 2) Arena publicada e quadra ativa da própria arena.
       const a = await loadPublicArena(admin, body.slug)
       if (!a) return json({ error: 'Arena indisponível' }, 404)
       const { data: court } = await admin.from('courts').select('id').eq('id', body.court_id).eq('arena_id', a.id).eq('active', true).maybeSingle()
       if (!court) return json({ error: 'Quadra indisponível' }, 404)
-      // Idempotency (escopo por arena, alinhado ao índice único (arena_id, idempotency_key))
-      if (body.idempotency_key) { const { data: ex } = await admin.from('reservations').select('public_code').eq('arena_id', a.id).eq('idempotency_key', body.idempotency_key).maybeSingle(); if (ex) return json({ public_code: ex.public_code, idempotent: true }) }
-      // Customer dedup (same organization only)
-      const phone = normalizePhone(body.phone)
+      // 3) Idempotência (escopo por arena, alinhado ao índice único (arena_id, idempotency_key)).
+      //    Mesmo ponto de antes (depois de arena/quadra): um retry legítimo da MESMA chave
+      //    devolve a reserva já criada mesmo que, segundos depois, o slot já tenha começado.
+      if (idem.value) { const { data: ex } = await admin.from('reservations').select('public_code').eq('arena_id', a.id).eq('idempotency_key', idem.value).maybeSingle(); if (ex) return json({ public_code: ex.public_code, idempotent: true }) }
+      // 4) Janela de data, expediente e slot REAL gerado pelo servidor.
+      const dateErr = checkPublicDate(body.date, todayInTZ())
+      if (dateErr) return json({ error: PUBLIC_ERRORS[dateErr] }, 400)
+      const weekday = new Date(`${body.date}T12:00:00${ARENA_OFFSET}`).getUTCDay()
+      const { data: bh } = await admin.from('business_hours').select('*').eq('arena_id', a.id).eq('weekday', weekday).maybeSingle()
+      if (!bh || bh.closed) return json({ error: PUBLIC_ERRORS.closed }, 400)
+      const { data: org } = await admin.from('organizations').select('default_reservation_minutes').eq('id', a.organization_id).maybeSingle()
+      const minutes = safeSlotMinutes(org?.default_reservation_minutes)
+      if (!minutes) return json({ error: PUBLIC_ERRORS.config }, 503)
+      const slot = findSlot(publicSlots(bh, minutes), body.start_time, body.end_time) // par EXATO, nunca só a duração
+      if (!slot) return json({ error: PUBLIC_ERRORS.slot }, 400)
+      if (slotStarted(body.date, slot.start, Date.now())) return json({ error: PUBLIC_ERRORS.slotPast }, 400)
+      // 5) Só agora: cliente (dedup por telefone dentro da organização) e reserva.
+      //    A constraint reservations_no_overlap continua sendo a autoridade final (409).
       let customer_id = null
       const { data: exc } = await admin.from('customers').select('id').eq('organization_id', a.organization_id).eq('phone', phone).limit(1).maybeSingle()
       if (exc) customer_id = exc.id
-      else { const { data: nc } = await admin.from('customers').insert({ organization_id: a.organization_id, arena_id: a.id, name: body.name, phone, email: body.email || null }).select('id').maybeSingle(); customer_id = nc?.id || null }
+      else { const { data: nc } = await admin.from('customers').insert({ organization_id: a.organization_id, arena_id: a.id, name, phone, email: email.value }).select('id').maybeSingle(); customer_id = nc?.id || null }
       const public_code = genCode()
       const { data: created, error } = await admin.from('reservations').insert({
         organization_id: a.organization_id, arena_id: a.id, court_id: body.court_id, customer_id,
-        start_at: toISO(body.date, body.start_time), end_at: endISO(body.date, body.start_time, body.end_time),
-        status: 'CONFIRMED', source: 'PUBLIC_WEB', notes: null, public_code, idempotency_key: body.idempotency_key || null,
+        start_at: toISO(body.date, slot.start), end_at: endISO(body.date, slot.start, slot.end),
+        status: 'CONFIRMED', source: 'PUBLIC_WEB', notes: null, public_code, idempotency_key: idem.value,
       }).select('public_code').maybeSingle()
       if (error) {
         if (isConflict(error)) return json({ error: 'Este horário acabou de ser reservado. Escolha outro horário.' }, 409)
         // Corrida de idempotência: dois cliques quase simultâneos com a mesma chave
-        if (error.code === '23505' && body.idempotency_key) { const { data: ex2 } = await admin.from('reservations').select('public_code').eq('arena_id', a.id).eq('idempotency_key', body.idempotency_key).maybeSingle(); if (ex2) return json({ public_code: ex2.public_code, idempotent: true }) }
+        if (error.code === '23505' && idem.value) { const { data: ex2 } = await admin.from('reservations').select('public_code').eq('arena_id', a.id).eq('idempotency_key', idem.value).maybeSingle(); if (ex2) return json({ public_code: ex2.public_code, idempotent: true }) }
         return json({ error: 'Não foi possível concluir a reserva' }, 400)
       }
       await admin.from('audit_logs').insert({ organization_id: a.organization_id, user_id: null, action: 'PUBLIC_RESERVATION_CREATED', entity_type: 'reservation', entity_id: null, metadata: { arena_id: a.id, court_id: body.court_id, public_code, source: 'PUBLIC_WEB' } })
