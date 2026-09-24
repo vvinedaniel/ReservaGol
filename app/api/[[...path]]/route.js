@@ -105,8 +105,18 @@ async function publishBlockers(supabase, arena) {
 // ---- Phase 02C helpers (recurring reservations / mensalistas) ----
 const RECUR_WINDOW_DAYS = 90
 const RECUR_TOPUP_THRESHOLD = 80 // só recarrega quando faltam poucos dias de janela
-// Projeção explícita de recurring_reservations (nunca `*`): colunas de negócio da série.
+// Projeção PÚBLICA de recurring_reservations (nunca `*`): as 20 colunas de negócio da ETAPA 0.
+// É a única usada em respostas da API — metadados B3 não aparecem para o cliente.
 const RECURRING_SERIES_COLUMNS = 'id,organization_id,arena_id,court_id,customer_id,frequency,weekday,day_of_month,start_time,end_time,start_date,end_date,has_no_end_date,status,default_price,notes,is_demo,created_by,created_at,updated_at'
+const RECURRING_SERIES_WITH_RELATIONS = `${RECURRING_SERIES_COLUMNS}, customer:customers(id,name,phone), court:courts(id,name), arena:arenas(id,name)`
+// Projeção INTERNA B3 (só preflight de idempotência; nunca devolvida ao cliente).
+// operation_request fica SEMPRE fora (authenticated não tem SELECT nessa coluna).
+// ROUTE B3 REQUIRES FOUNDATION: estas colunas e as RPCs rg_recurring_* só existem depois de
+// supabase/migration_security_b3.sql. Não publicar este route antes da FOUNDATION.
+const RECURRING_SERIES_B3_INTERNAL = 'id,operation_kind,previous_series_id'
+const SKIPPED_REASON = 'Horário já reservado ou bloqueado'
+const PREVIEW_UNAVAILABLE_MSG = 'Não foi possível validar a agenda agora. Tente novamente.'
+const IDEMPOTENCY_MISMATCH_MSG = 'Esta operação já foi utilizada com dados diferentes. Atualize e tente novamente.'
 function pad2(n) { return String(n).padStart(2, '0') }
 function weekdayOf(dateStr) { return new Date(`${dateStr}T12:00:00${ARENA_OFFSET}`).getUTCDay() }
 function dateAddDays(dateStr, n) {
@@ -160,28 +170,38 @@ function computeAnchors(series, fromDate, toDate) {
   return out
 }
 
+// Falha ao ler o que o preview precisa: FAIL-CLOSED (nunca vira "sem conflitos").
+class PreviewUnavailableError extends Error {
+  constructor(what) { super(`preview indisponível: ${what}`); this.name = 'PreviewUnavailableError' }
+}
+
 // Dry-run of which anchors can be created vs which conflict. `db` = user-scoped supabase.
 // `ignore` = { seriesId, fromDate }: ignora na pré-validação SOMENTE as ocorrências ativas dessa
 // série com start_at >= fromDate (as mesmas que o reschedule cancela). Outras séries e reservas
 // comuns continuam contando. A constraint anti-overlap segue como autoridade final.
+// B3: o preview é UX/planejamento; a RPC valida cada data recebida (âncora + janela), mas não
+// prova que recebeu todas — por isso qualquer erro de leitura aqui LANÇA PreviewUnavailableError.
 async function previewOccurrences(db, series, fromDate, toDate, ignore = null) {
   const anchors = computeAnchors(series, fromDate, toDate)
   const result = { anchors, toCreate: [], conflicts: [], existing: [] }
   if (!anchors.length) return result
   // business hours map
-  const { data: hoursRows } = await db.from('business_hours').select('*').eq('arena_id', series.arena_id)
+  const { data: hoursRows, error: hoursErr } = await db.from('business_hours').select('*').eq('arena_id', series.arena_id)
+  if (hoursErr) throw new PreviewUnavailableError('business_hours')
   const hours = {}; for (const h of (hoursRows || [])) hours[h.weekday] = h
   // existing occurrences of THIS series (skip — idempotent). Only if series persisted.
   const existingSet = new Set()
   if (series.id) {
-    const { data: ex } = await db.from('reservations').select('occurrence_date').eq('recurring_reservation_id', series.id).in('occurrence_date', anchors)
+    const { data: ex, error: exErr } = await db.from('reservations').select('occurrence_date').eq('recurring_reservation_id', series.id).in('occurrence_date', anchors)
+    if (exErr) throw new PreviewUnavailableError('anchors')
     for (const r of (ex || [])) if (r.occurrence_date) existingSet.add(r.occurrence_date)
   }
   // active reservations on this court within the window (for overlap pre-check)
   const first = anchors[0], last = anchors[anchors.length - 1]
-  const { data: courtRes } = await db.from('reservations').select('start_at,end_at,status,recurring_reservation_id')
+  const { data: courtRes, error: courtErr } = await db.from('reservations').select('start_at,end_at,status,recurring_reservation_id')
     .eq('court_id', series.court_id).neq('status', 'CANCELLED').neq('status', 'NO_SHOW')
     .gte('start_at', `${dateAddDays(first, -1)}T00:00:00${ARENA_OFFSET}`).lte('start_at', `${last}T23:59:59${ARENA_OFFSET}`) // -1 dia: pega reservas que viram a meia-noite
+  if (courtErr) throw new PreviewUnavailableError('reservations')
   const ignoreFrom = ignore ? new Date(`${ignore.fromDate}T00:00:00${ARENA_OFFSET}`).getTime() : null
   const active = (courtRes || []).filter((r) => {
     if (series.id && r.recurring_reservation_id === series.id) return false
@@ -204,50 +224,88 @@ async function previewOccurrences(db, series, fromDate, toDate, ignore = null) {
   return result
 }
 
-// Insert occurrences (respecting the DB anti-overlap constraint as final authority).
-async function materialize(db, series, dates, userId) {
-  const created = [], skipped = []
-  for (const date of dates) {
-    const { error } = await db.from('reservations').insert({
-      organization_id: series.organization_id, arena_id: series.arena_id, court_id: series.court_id,
-      customer_id: series.customer_id || null,
-      start_at: toISO(date, series.start_time), end_at: endISO(date, series.start_time, series.end_time),
-      status: 'CONFIRMED', source: 'RECORRENTE', notes: series.notes || null,
-      price: series.default_price ?? null, recurring_reservation_id: series.id, occurrence_date: date, created_by: userId,
-    })
-    if (error) {
-      if (error.code === '23505') { /* já materializada — idempotente */ }
-      else if (isConflict(error)) skipped.push({ date, reason: 'Horário já reservado ou bloqueado' })
-      else skipped.push({ date, reason: 'Não foi possível criar' })
-    } else created.push(date)
-  }
-  return { created, skipped }
-}
+// ---- B3: mutações de série SOMENTE via RPCs atômicas (supabase/migration_security_b3.sql) ----
+// Cada RPC = 1 transação: trava a série, valida estado/datas, materializa, cancela e audita.
+// O JS não grava recurring_reservations nem ocorrências recorrentes diretamente.
 
-// Cancel future (not yet played) occurrences of a series. Keeps history intact.
-async function cancelFutureOccurrences(db, seriesId, fromDate) {
-  const from = fromDate || todayInTZ()
-  const { data, error } = await db.from('reservations').update({ status: 'CANCELLED' })
-    .eq('recurring_reservation_id', seriesId).neq('status', 'CANCELLED')
-    .gte('start_at', `${from}T00:00:00${ARENA_OFFSET}`).select('id')
-  if (error) throw error
-  return (data || []).length
-}
-
-// Opportunistic, idempotent top-up so no-end / long series always have ~90d ahead.
-async function topUpSeries(db, series, userId) {
-  if (series.status !== 'ACTIVE') return { created: [] }
+// Datas do top-up (mesma regra do topUp anterior): só quando faltam poucos dias de janela.
+async function topUpDates(db, series) {
   const today = todayInTZ()
   const to = dateAddDays(today, RECUR_WINDOW_DAYS)
-  const { data: maxRow } = await db.from('reservations').select('occurrence_date')
+  const { data: maxRow, error } = await db.from('reservations').select('occurrence_date')
     .eq('recurring_reservation_id', series.id).order('occurrence_date', { ascending: false }).limit(1).maybeSingle()
+  if (error) throw new PreviewUnavailableError('latest anchor')
   const latest = maxRow?.occurrence_date || null
-  if (latest && latest >= dateAddDays(today, RECUR_TOPUP_THRESHOLD)) return { created: [] } // janela ainda cheia
+  if (latest && latest >= dateAddDays(today, RECUR_TOPUP_THRESHOLD)) return { dates: [], conflicts: [] } // janela ainda cheia
   const from = series.start_date > today ? series.start_date : today
   const prev = await previewOccurrences(db, series, from, to)
-  if (!prev.toCreate.length) return { created: [] }
-  const res = await materialize(db, series, prev.toCreate, userId)
-  return res
+  return { dates: prev.toCreate, conflicts: prev.conflicts }
+}
+
+// Opportunistic, idempotent top-up so no-end / long series always have ~90d ahead (RPC generate).
+// RGR01 (a série deixou de estar ACTIVE, ex.: pause concorrente) = no-op. Outros erros LANÇAM.
+async function topUpSeries(db, series) {
+  if (series.status !== 'ACTIVE') return { created: [] }
+  const { dates } = await topUpDates(db, series)
+  if (!dates.length) return { created: [] }
+  const { data, error } = await db.rpc('rg_recurring_generate', { p_series_id: series.id, p_dates: dates })
+  if (error) {
+    if (error.code === 'RGR01') return { created: [] }
+    throw error
+  }
+  return { created: data?.created || [] }
+}
+
+// Top-up disparado por GET: nunca derruba a leitura, mas nunca é silencioso.
+async function topUpForRead(db, series, where) {
+  try { await topUpSeries(db, series) }
+  catch (e) { console.error(`topup (${where})`, series?.id, e?.code || e?.name || 'erro', e?.message || '') }
+}
+
+function skippedList(dates) { return (dates || []).map((date) => ({ date, reason: SKIPPED_REASON })) }
+
+// Mapeia erro de RPC B3 para resposta HTTP genérica (sem nomes de constraint/função/SQL).
+function rpcErrorResponse(error, ctx = {}) {
+  const code = error?.code
+  if (code === '42501') return json({ error: ctx.forbidden || 'Sem permissão' }, 403)
+  if (code === 'P0002') return json({ error: ctx.notFound || 'Mensalista não encontrado' }, 404)
+  if (code === 'RGR02') return json({ error: IDEMPOTENCY_MISMATCH_MSG, code: 'IDEMPOTENCY_MISMATCH' }, 409)
+  if (code === 'RGR01') return json({ error: ctx.state || 'A situação atual do mensalista não permite esta ação. Atualize e tente novamente.' }, ctx.stateStatus || 409)
+  if (code === '23P01') return json({ error: CONFLICT_MSG }, 409)
+  if (code === '23505') return json({ error: 'Este mensalista foi alterado por outra operação. Atualize e tente novamente.' }, 409)
+  if (isTenantViolation(error)) return json({ error: TENANT_MSG }, 400)
+  if (['22023', '23514', '23502', '23503', '22P02', '22007', '22008', 'P0001'].includes(code)) return json({ error: ctx.invalid || 'Dados inválidos para esta operação' }, 400)
+  if (['40P01', '40001', '55P03'].includes(code)) return json({ error: 'Operação concorrente em andamento. Tente novamente em instantes.' }, 503)
+  console.error('rpc', ctx.op || '?', code || 'sem código')
+  return json({ error: 'Erro interno do servidor' }, 500)
+}
+
+// UUID (v1-v8) gerado pela UI por intenção e reutilizado nos retries da MESMA ação.
+function validOperationId(v) { return typeof v === 'string' && isUuid(v) }
+
+// Preflight de idempotência: só DETECTA que o operation_id já foi confirmado NA ORGANIZAÇÃO
+// (mesmo escopo do UNIQUE (organization_id, operation_id); organização derivada no servidor:
+// da arena no create, da série carregada no reschedule — nunca do body). operation_request não
+// é legível: quem decide replay x mismatch é SEMPRE a RPC.
+// Erro de leitura = fail-closed (lança), para não seguir ao preview e gerar needs_decision falso.
+async function operationAlreadyRecorded(db, organizationId, operationId) {
+  const { data, error } = await db.from('recurring_reservations').select(RECURRING_SERIES_B3_INTERNAL)
+    .eq('organization_id', organizationId).eq('operation_id', operationId).limit(1)
+  if (error) throw new PreviewUnavailableError('operation preflight')
+  return (data || []).length > 0
+}
+
+// Antes da RPC: erro de leitura propaga (500 genérico). Depois de uma RPC já confirmada: leitura
+// "best effort" só para montar a resposta — a operação não é reportada como falha por isso.
+async function loadSeries(db, id, columns = RECURRING_SERIES_COLUMNS) {
+  const { data, error } = await db.from('recurring_reservations').select(columns).eq('id', id).maybeSingle()
+  if (error) throw error
+  return data
+}
+async function loadSeriesSafe(db, id) {
+  const { data, error } = await db.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('id', id).maybeSingle()
+  if (error) console.error('série pós-RPC', id, error.code || '')
+  return data || null
 }
 
 
@@ -616,10 +674,10 @@ async function handleRoute(request, { params }) {
       const { data: arena } = await supabase.from('arenas').select('*').eq('id', arena_id).maybeSingle()
       if (!arena) return json({ error: 'Arena não encontrada' }, 404)
       // Top-up idempotente e guardado das séries ativas desta arena (barato quando a janela já está cheia).
-      try {
-        const { data: aSeries } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('arena_id', arena_id).eq('status', 'ACTIVE')
-        for (const s of (aSeries || [])) { await topUpSeries(supabase, s, user.id) }
-      } catch (e) { console.error('agenda topup', e?.message) }
+      // B3: top-up via RPC; falha de uma série é registrada e não interrompe as demais nem a leitura.
+      const { data: aSeries, error: aSeriesErr } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('arena_id', arena_id).eq('status', 'ACTIVE')
+      if (aSeriesErr) console.error('agenda topup: leitura das séries', aSeriesErr.code || '')
+      for (const s of (aSeries || [])) { await topUpForRead(supabase, s, 'agenda') }
       const [{ data: org }, { data: courts }] = await Promise.all([
         supabase.from('organizations').select('id, default_reservation_minutes').eq('id', arena.organization_id).maybeSingle(),
         supabase.from('courts').select('*').eq('arena_id', arena_id).eq('active', true).order('created_at'),
@@ -726,6 +784,9 @@ async function handleRoute(request, { params }) {
     }
 
     // -------------------------------------------- /recurring-reservations
+    // B3 — ROUTE B3 REQUIRES FOUNDATION (supabase/migration_security_b3.sql). Toda mutação de série
+    // passa por uma RPC rg_recurring_* (1 transação: trava, estado, materialização, cancelamento e
+    // audit). Aqui só há validação de entrada, preview FAIL-CLOSED (UX) e mapeamento da resposta.
     if (resource === 'recurring-reservations') {
       // POST /recurring-reservations  (dry_run=preview | create). skip_conflicts opcional.
       if (method === 'POST' && !id) {
@@ -737,49 +798,95 @@ async function handleRoute(request, { params }) {
         if (body.frequency === 'MONTHLY' && !body.day_of_month) return json({ error: 'Selecione o dia do mês' }, 400)
         if (!body.has_no_end_date && !body.end_date) return json({ error: 'Informe a data final ou marque "sem data final"' }, 400)
         if (sameTime(body.start_time, body.end_time)) return json({ error: SAME_TIME_MSG }, 400)
+        const operationId = body.operation_id
+        if (!body.dry_run && !validOperationId(operationId)) return json({ error: 'Operação inválida. Atualize a página e tente novamente.' }, 400)
 
-        let customer_id = body.customer_id || null
-        if (!customer_id && body.customer) { try { customer_id = await resolveCustomerId(supabase, { organization_id: body.organization_id, arena_id: body.arena_id, customer: body.customer }) } catch { return json({ error: 'Não foi possível salvar o cliente' }, 400) } }
-
-        const transient = {
-          id: null, organization_id: body.organization_id, arena_id: body.arena_id, court_id: body.court_id, customer_id,
-          frequency: body.frequency, weekday: body.weekday ?? null, day_of_month: body.day_of_month ?? null,
-          start_time: body.start_time, end_time: body.end_time, start_date: body.start_date,
-          end_date: body.end_date || null, has_no_end_date: !!body.has_no_end_date,
-          default_price: body.default_price ?? null, notes: body.notes || null, status: 'ACTIVE',
+        // Intenção enviada à RPC: o cliente é resolvido/criado DENTRO da transação (nunca antes).
+        const customerId = body.customer_id || null
+        const createArgs = (dates) => ({
+          p_operation_id: operationId, p_arena_id: body.arena_id, p_court_id: body.court_id,
+          p_customer_id: customerId, p_customer: customerId ? null : (body.customer || null),
+          p_frequency: body.frequency, p_weekday: body.weekday ?? null, p_day_of_month: body.day_of_month ?? null,
+          p_start_time: body.start_time, p_end_time: body.end_time, p_start_date: body.start_date,
+          p_end_date: body.end_date || null, p_has_no_end_date: !!body.has_no_end_date,
+          p_default_price: body.default_price ?? null, p_notes: body.notes || null, p_is_demo: !!body.is_demo,
+          p_skip_conflicts: !!body.skip_conflicts, p_dates: dates,
+        })
+        const createCtx = { op: 'create', forbidden: 'Sem permissão para criar mensalista', notFound: 'Arena não encontrada' }
+        // Replay (idempotent=true): 200 sem contadores; execução nova: 201 com os números da transação.
+        const createResult = async (data, prev) => {
+          const series = await loadSeriesSafe(supabase, data.series_id)
+          if (data.idempotent) return json({ id: data.series_id, series, idempotent: true }, 200)
+          return json({ id: data.series_id, series, idempotent: false, created: (data.created || []).length, ignored: prev?.conflicts || [], skipped: skippedList(data.skipped) }, 201)
         }
-        const today = todayInTZ()
-        const from = transient.start_date > today ? transient.start_date : today
-        const to = dateAddDays(today, RECUR_WINDOW_DAYS)
-        const prev = await previewOccurrences(supabase, transient, from, to)
 
-        if (body.dry_run) return json({ toCreate: prev.toCreate.length, conflicts: prev.conflicts, dates: prev.toCreate })
-        if (prev.conflicts.length && !body.skip_conflicts) return json({ error: 'Conflitos encontrados', conflicts: prev.conflicts, toCreate: prev.toCreate.length, needs_decision: true }, 409)
-        if (!prev.toCreate.length && !body.skip_conflicts) return json({ error: 'Nenhuma data disponível para criar', conflicts: prev.conflicts }, 400)
+        try {
+          // Retry de operação já confirmada: resolvido ANTES de preview, cliente ou needs_decision.
+          // Escopo = organização da ARENA (derivada no servidor, como na RPC). O SELECT só detecta;
+          // quem decide replay x RGR02 é a RPC (compara operation_request).
+          let opOrg = null
+          const replayCreate = async () => {
+            const { data, error } = await supabase.rpc('rg_recurring_create', createArgs([]))
+            if (error) return rpcErrorResponse(error, createCtx)
+            return await createResult(data, null)
+          }
+          if (!body.dry_run) {
+            const { data: arenaRow, error: arenaErr } = await supabase.from('arenas').select('organization_id').eq('id', body.arena_id).maybeSingle()
+            if (arenaErr) throw new PreviewUnavailableError('arena')
+            if (!arenaRow) return json({ error: 'Arena não encontrada' }, 404)
+            opOrg = arenaRow.organization_id
+            if (await operationAlreadyRecorded(supabase, opOrg, operationId)) return await replayCreate()
+          }
 
-        const { data: series, error: sErr } = await supabase.from('recurring_reservations').insert({
-          organization_id: transient.organization_id, arena_id: transient.arena_id, court_id: transient.court_id, customer_id,
-          frequency: transient.frequency, weekday: transient.weekday, day_of_month: transient.day_of_month,
-          start_time: transient.start_time, end_time: transient.end_time, start_date: transient.start_date,
-          end_date: transient.end_date, has_no_end_date: transient.has_no_end_date,
-          default_price: transient.default_price, notes: transient.notes, is_demo: !!body.is_demo, created_by: user.id, status: 'ACTIVE',
-        }).select(RECURRING_SERIES_COLUMNS).maybeSingle()
-        if (sErr || !series) return json({ error: 'Sem permissão para criar mensalista' }, 403)
+          const transient = {
+            id: null, organization_id: body.organization_id, arena_id: body.arena_id, court_id: body.court_id, customer_id: customerId,
+            frequency: body.frequency, weekday: body.weekday ?? null, day_of_month: body.day_of_month ?? null,
+            start_time: body.start_time, end_time: body.end_time, start_date: body.start_date,
+            end_date: body.end_date || null, has_no_end_date: !!body.has_no_end_date,
+            default_price: body.default_price ?? null, notes: body.notes || null, status: 'ACTIVE',
+          }
+          const today = todayInTZ()
+          const from = transient.start_date > today ? transient.start_date : today
+          const to = dateAddDays(today, RECUR_WINDOW_DAYS)
+          const prev = await previewOccurrences(supabase, transient, from, to)
 
-        const mat = await materialize(supabase, { ...transient, id: series.id }, prev.toCreate, user.id)
-        await supabase.from('audit_logs').insert({ organization_id: series.organization_id, user_id: user.id, action: 'RECURRING_RESERVATION_CREATED', entity_type: 'recurring_reservation', entity_id: series.id, metadata: { frequency: series.frequency, created: mat.created.length, ignored: prev.conflicts.length } })
-        return json({ id: series.id, series, created: mat.created.length, ignored: prev.conflicts, skipped: mat.skipped }, 201)
+          if (body.dry_run) return json({ toCreate: prev.toCreate.length, conflicts: prev.conflicts, dates: prev.toCreate })
+          if (prev.conflicts.length && !body.skip_conflicts) {
+            // Double-click: se a tentativa anterior com a MESMA chave confirmou enquanto este request
+            // estava no preview, os "conflitos" são a própria série — rechecar antes de pedir decisão.
+            // (O preview só enxerga linhas já confirmadas; esta rechecagem vem depois dele.)
+            if (await operationAlreadyRecorded(supabase, opOrg, operationId)) return await replayCreate()
+            return json({ error: 'Conflitos encontrados', conflicts: prev.conflicts, toCreate: prev.toCreate.length, needs_decision: true }, 409)
+          }
+          if (!prev.toCreate.length && !body.skip_conflicts) return json({ error: 'Nenhuma data disponível para criar', conflicts: prev.conflicts }, 400)
+
+          const { data, error } = await supabase.rpc('rg_recurring_create', createArgs(prev.toCreate))
+          if (error) {
+            // skip_conflicts=false e um horário foi ocupado depois do preview: nada persistiu (D3);
+            // devolve os conflitos atuais para a decisão do usuário.
+            if (error.code === '23P01' && !body.skip_conflicts) {
+              const again = await previewOccurrences(supabase, transient, from, to)
+              if (again.conflicts.length) return json({ error: 'Conflitos encontrados', conflicts: again.conflicts, toCreate: again.toCreate.length, needs_decision: true }, 409)
+            }
+            return rpcErrorResponse(error, createCtx)
+          }
+          return await createResult(data, prev)
+        } catch (e) {
+          if (e instanceof PreviewUnavailableError) return json({ error: PREVIEW_UNAVAILABLE_MSG }, 503)
+          throw e
+        }
       }
 
       // GET /recurring-reservations?organization_id=&status=&q=
       if (method === 'GET' && !id) {
         const organization_id = url.searchParams.get('organization_id')
         if (!organization_id) return json({ error: 'organization_id é obrigatório' }, 400)
-        // top-up idempotente das séries ativas ao abrir a tela
-        const { data: activeSeries } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('organization_id', organization_id).eq('status', 'ACTIVE')
-        for (const s of (activeSeries || [])) { try { await topUpSeries(supabase, s, user.id) } catch (e) { console.error('topup', e?.message) } }
+        // top-up idempotente das séries ativas ao abrir a tela (RPC generate; falhas são registradas)
+        const { data: activeSeries, error: activeErr } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('organization_id', organization_id).eq('status', 'ACTIVE')
+        if (activeErr) console.error('topup (lista): leitura das séries', activeErr.code || '')
+        for (const s of (activeSeries || [])) { await topUpForRead(supabase, s, 'lista') }
         const status = url.searchParams.get('status')
-        let q = supabase.from('recurring_reservations').select(`${RECURRING_SERIES_COLUMNS}, customer:customers(id,name,phone), court:courts(id,name), arena:arenas(id,name)`).eq('organization_id', organization_id).order('created_at', { ascending: false })
+        let q = supabase.from('recurring_reservations').select(RECURRING_SERIES_WITH_RELATIONS).eq('organization_id', organization_id).order('created_at', { ascending: false })
         if (status) q = q.eq('status', status)
         const { data, error } = await q
         if (error) throw error
@@ -799,131 +906,168 @@ async function handleRoute(request, { params }) {
 
       // GET /recurring-reservations/:id  -> detalhe + próximas ocorrências
       if (method === 'GET' && id) {
-        const { data: series } = await supabase.from('recurring_reservations').select(`${RECURRING_SERIES_COLUMNS}, customer:customers(id,name,phone), court:courts(id,name), arena:arenas(id,name)`).eq('id', id).maybeSingle()
+        const { data: series } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_WITH_RELATIONS).eq('id', id).maybeSingle()
         if (!series) return json({ error: 'Mensalista não encontrado' }, 404)
-        try { await topUpSeries(supabase, series, user.id) } catch {}
+        await topUpForRead(supabase, series, 'detalhe')
         const nowISO = new Date().toISOString()
         const { data: upcoming } = await supabase.from('reservations').select('id,start_at,end_at,status,is_exception,occurrence_date,court:courts(id,name)').eq('recurring_reservation_id', id).neq('status', 'CANCELLED').gte('start_at', nowISO).order('start_at', { ascending: true }).limit(30)
         return json({ ...series, upcoming: upcoming || [] })
       }
 
-      // PATCH /recurring-reservations/:id  -> editar campos simples da série
+      // PATCH /recurring-reservations/:id  -> editar campos simples da série (RPC update + audit).
+      // D9: top-up é uma chamada/transação SEPARADA depois do update.
       if (method === 'PATCH' && id) {
         const body = await readBody(request)
-        const patch = {}
+        const changes = {}
         // customer_id da série é imutável no banco (A2); mudança estrutural só via "Esta e as próximas".
-        ;['notes', 'default_price', 'end_date', 'has_no_end_date'].forEach((k) => { if (body[k] !== undefined) patch[k] = body[k] })
-        const { data: series, error } = await supabase.from('recurring_reservations').update(patch).eq('id', id).select(RECURRING_SERIES_COLUMNS).maybeSingle()
-        if (error || !series) return json({ error: 'Sem permissão para editar mensalista' }, 403)
-        try { await topUpSeries(supabase, series, user.id) } catch {}
-        await supabase.from('audit_logs').insert({ organization_id: series.organization_id, user_id: user.id, action: 'RECURRING_RESERVATION_UPDATED', entity_type: 'recurring_reservation', entity_id: id })
+        ;['notes', 'default_price', 'end_date', 'has_no_end_date'].forEach((k) => { if (body[k] !== undefined) changes[k] = body[k] })
+        const { error } = await supabase.rpc('rg_recurring_update', { p_series_id: id, p_changes: changes })
+        if (error) return rpcErrorResponse(error, { op: 'update', forbidden: 'Sem permissão para editar mensalista' })
+        const series = await loadSeriesSafe(supabase, id)
+        if (!series) return json({ error: 'Mensalista não encontrado' }, 404)
+        await topUpForRead(supabase, series, 'patch')
         return json(series)
       }
 
-      // POST /recurring-reservations/:id/pause  {cancel_future}
+      // POST /recurring-reservations/:id/pause  {cancel_future}  (RPC: status + futuras + audit)
       if (method === 'POST' && id && sub === 'pause') {
         const body = await readBody(request)
-        const { data: series, error } = await supabase.from('recurring_reservations').update({ status: 'PAUSED' }).eq('id', id).select(RECURRING_SERIES_COLUMNS).maybeSingle()
-        if (error || !series) return json({ error: 'Sem permissão' }, 403)
-        let cancelled = 0
-        if (body.cancel_future) cancelled = await cancelFutureOccurrences(supabase, id)
-        await supabase.from('audit_logs').insert({ organization_id: series.organization_id, user_id: user.id, action: 'RECURRING_RESERVATION_PAUSED', entity_type: 'recurring_reservation', entity_id: id, metadata: { cancelled_future: cancelled } })
-        return json({ series, cancelled_future: cancelled })
+        const { data, error } = await supabase.rpc('rg_recurring_pause', { p_series_id: id, p_cancel_future: !!body.cancel_future })
+        if (error) return rpcErrorResponse(error, { op: 'pause', state: 'Mensalista cancelado não pode ser pausado.' })
+        const series = await loadSeriesSafe(supabase, id)
+        return json({ series, cancelled_future: data?.cancelled_future ?? 0 })
       }
 
-      // POST /recurring-reservations/:id/reactivate
+      // POST /recurring-reservations/:id/reactivate  (RPC: status + materialização + audit)
+      // D10 mantido: âncoras canceladas pelo pause continuam ocupadas (não são recriadas).
       if (method === 'POST' && id && sub === 'reactivate') {
-        const { data: series, error } = await supabase.from('recurring_reservations').update({ status: 'ACTIVE' }).eq('id', id).select(RECURRING_SERIES_COLUMNS).maybeSingle()
-        if (error || !series) return json({ error: 'Sem permissão' }, 403)
-        const mat = await topUpSeries(supabase, series, user.id)
-        await supabase.from('audit_logs').insert({ organization_id: series.organization_id, user_id: user.id, action: 'RECURRING_RESERVATION_REACTIVATED', entity_type: 'recurring_reservation', entity_id: id, metadata: { created: (mat.created || []).length } })
-        return json({ series, created: (mat.created || []).length })
+        const current = await loadSeries(supabase, id)
+        if (!current) return json({ error: 'Mensalista não encontrado' }, 404)
+        let dates = []
+        if (current.status === 'PAUSED') {
+          try { ({ dates } = await topUpDates(supabase, current)) }
+          catch (e) { if (e instanceof PreviewUnavailableError) return json({ error: PREVIEW_UNAVAILABLE_MSG }, 503); throw e }
+        }
+        const { data, error } = await supabase.rpc('rg_recurring_reactivate', { p_series_id: id, p_dates: dates })
+        if (error) return rpcErrorResponse(error, { op: 'reactivate', state: 'Mensalista cancelado não pode ser reativado.' })
+        const series = await loadSeriesSafe(supabase, id)
+        return json({ series, created: (data?.created || []).length, skipped: skippedList(data?.skipped) })
       }
 
-      // POST /recurring-reservations/:id/cancel
+      // POST /recurring-reservations/:id/cancel  (RPC: status + futuras + audit; repetido = no-op)
       if (method === 'POST' && id && sub === 'cancel') {
-        const { data: series, error } = await supabase.from('recurring_reservations').update({ status: 'CANCELLED' }).eq('id', id).select(RECURRING_SERIES_COLUMNS).maybeSingle()
-        if (error || !series) return json({ error: 'Sem permissão' }, 403)
-        const cancelled = await cancelFutureOccurrences(supabase, id)
-        await supabase.from('audit_logs').insert({ organization_id: series.organization_id, user_id: user.id, action: 'RECURRING_RESERVATION_CANCELLED', entity_type: 'recurring_reservation', entity_id: id, metadata: { cancelled_future: cancelled } })
-        return json({ series, cancelled_future: cancelled })
+        const { data, error } = await supabase.rpc('rg_recurring_cancel', { p_series_id: id })
+        if (error) return rpcErrorResponse(error, { op: 'cancel' })
+        const series = await loadSeriesSafe(supabase, id)
+        return json({ series, cancelled_future: data?.cancelled_future ?? 0 })
       }
 
-      // POST /recurring-reservations/:id/generate  -> botão "Gerar próximas"
+      // POST /recurring-reservations/:id/generate  -> botão "Gerar próximas" (RPC generate)
       if (method === 'POST' && id && sub === 'generate') {
-        const { data: series } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('id', id).maybeSingle()
+        const series = await loadSeries(supabase, id)
         if (!series) return json({ error: 'Mensalista não encontrado' }, 404)
         if (series.status !== 'ACTIVE') return json({ error: 'A série precisa estar ativa para gerar novas reservas' }, 400)
         const today = todayInTZ()
         const from = series.start_date > today ? series.start_date : today
-        const prev = await previewOccurrences(supabase, series, from, dateAddDays(today, RECUR_WINDOW_DAYS))
-        const mat = await materialize(supabase, series, prev.toCreate, user.id)
-        return json({ created: mat.created.length, conflicts: prev.conflicts })
+        let prev
+        try { prev = await previewOccurrences(supabase, series, from, dateAddDays(today, RECUR_WINDOW_DAYS)) }
+        catch (e) { if (e instanceof PreviewUnavailableError) return json({ error: PREVIEW_UNAVAILABLE_MSG }, 503); throw e }
+        if (!prev.toCreate.length) return json({ created: 0, conflicts: prev.conflicts, skipped: [] })
+        const { data, error } = await supabase.rpc('rg_recurring_generate', { p_series_id: id, p_dates: prev.toCreate })
+        if (error) return rpcErrorResponse(error, { op: 'generate', state: 'A série precisa estar ativa para gerar novas reservas', stateStatus: 400 })
+        return json({ created: (data?.created || []).length, conflicts: prev.conflicts, skipped: skippedList(data?.skipped) })
       }
 
       // POST /recurring-reservations/:id/reschedule  -> "esta e as próximas"
-      // Ordem segura: permissão -> pré-validação -> encerra série antiga -> cria nova série
-      // (restaura a antiga se falhar) -> só então cancela ocorrências futuras -> materializa.
-      // Ainda NÃO é atômico (sem transação/RPC): dívida técnica registrada.
+      // Atômico via RPC: trava a antiga, cria a nova (linhagem + operation_id), encerra a antiga,
+      // cancela as futuras antigas, materializa a nova e audita — ou nada acontece.
       if (method === 'POST' && id && sub === 'reschedule') {
         const body = await readBody(request)
         const from_date = body.from_date
         if (!from_date) return json({ error: 'from_date é obrigatório' }, 400)
-        const { data: old } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('id', id).maybeSingle()
-        if (!old) return json({ error: 'Mensalista não encontrado' }, 404)
-        // 1) Permissão ANTES de qualquer alteração (RECEPTIONIST -> 403, nada é tocado).
-        if (!(await canManageOrg(supabase, user.id, old.organization_id))) return json({ error: 'Sem permissão para reagendar mensalista' }, 403)
-        // Nova série (a partir de from_date) copiando campos e aplicando mudanças.
-        const next = {
-          id: null, organization_id: old.organization_id, arena_id: old.arena_id,
-          court_id: body.court_id || old.court_id, customer_id: old.customer_id,
-          frequency: body.frequency || old.frequency,
-          weekday: body.weekday !== undefined ? body.weekday : old.weekday,
-          day_of_month: body.day_of_month !== undefined ? body.day_of_month : old.day_of_month,
-          start_time: body.start_time || old.start_time, end_time: body.end_time || old.end_time,
-          start_date: from_date, end_date: old.end_date, has_no_end_date: old.has_no_end_date,
-          default_price: body.default_price !== undefined ? body.default_price : old.default_price,
-          notes: body.notes !== undefined ? body.notes : old.notes, status: 'ACTIVE',
+        if (!isRealDate(from_date)) return json({ error: 'Data inválida' }, 400)
+        const operationId = body.operation_id
+        if (!body.dry_run && !validOperationId(operationId)) return json({ error: 'Operação inválida. Atualize a página e tente novamente.' }, 400)
+        // Mudanças pedidas (mesma semântica anterior: quadra/frequência/horários só quando informados).
+        const changes = {}
+        if (body.court_id) changes.court_id = body.court_id
+        if (body.frequency) changes.frequency = body.frequency
+        if (body.weekday !== undefined) changes.weekday = body.weekday
+        if (body.day_of_month !== undefined) changes.day_of_month = body.day_of_month
+        if (body.start_time) changes.start_time = body.start_time
+        if (body.end_time) changes.end_time = body.end_time
+        if (body.default_price !== undefined) changes.default_price = body.default_price
+        if (body.notes !== undefined) changes.notes = body.notes
+        const rescheduleArgs = (dates) => ({
+          p_series_id: id, p_operation_id: operationId, p_from_date: from_date, p_changes: changes,
+          p_skip_conflicts: !!body.skip_conflicts, p_dates: dates,
+        })
+        const rescheduleCtx = { op: 'reschedule', forbidden: 'Sem permissão para reagendar mensalista', state: 'Este mensalista não pode ser reagendado a partir desta data. Atualize e tente novamente.' }
+        const rescheduleResult = async (data, prev) => {
+          const series = await loadSeriesSafe(supabase, data.new_series_id)
+          // `previous` = série de origem (o :id desta rota; mesmo campo de antes do B3).
+          if (data.idempotent) return json({ id: data.new_series_id, series, previous: id, idempotent: true }, 200)
+          return json({ id: data.new_series_id, series, previous: id, idempotent: false, created: (data.created || []).length, ignored: prev?.conflicts || [], skipped: skippedList(data.skipped), cancelled_future: data.cancelled_future ?? 0 }, 201)
         }
-        if (sameTime(next.start_time, next.end_time)) return json({ error: SAME_TIME_MSG }, 400)
-        const today = todayInTZ()
-        const from = next.start_date > today ? next.start_date : today
-        const to = dateAddDays(today, RECUR_WINDOW_DAYS)
-        // 2) Pré-validação ignorando apenas as ocorrências da própria série antiga a partir de from_date.
-        const prev = await previewOccurrences(supabase, next, from, to, { seriesId: id, fromDate: from_date })
-        if (body.dry_run) return json({ toCreate: prev.toCreate.length, conflicts: prev.conflicts })
-        if (prev.conflicts.length && !body.skip_conflicts) return json({ error: 'Conflitos encontrados', conflicts: prev.conflicts, toCreate: prev.toCreate.length, needs_decision: true }, 409)
-        // 3) Encerra a série antiga em from_date-1 (ou cancela, se reagendada desde o início).
-        //    RLS filtra UPDATE sem erro: exigir a linha de volta; sem ela, PARA aqui.
-        const oldEnd = dateAddDays(from_date, -1)
-        const oldPatch = oldEnd < old.start_date ? { status: 'CANCELLED' } : { end_date: oldEnd, has_no_end_date: false }
-        const { data: oldUpd, error: oldErr } = await supabase.from('recurring_reservations').update(oldPatch).eq('id', id).select('id').maybeSingle()
-        if (oldErr || !oldUpd) return json({ error: 'Não foi possível atualizar a série atual. Nenhuma reserva foi alterada.' }, 403)
-        // 4) Cria a nova série. Se falhar, restaura a antiga e para (nenhuma ocorrência foi cancelada).
-        const { data: series, error: sErr } = await supabase.from('recurring_reservations').insert({
-          organization_id: next.organization_id, arena_id: next.arena_id, court_id: next.court_id, customer_id: next.customer_id,
-          frequency: next.frequency, weekday: next.weekday, day_of_month: next.day_of_month,
-          start_time: next.start_time, end_time: next.end_time, start_date: next.start_date, end_date: next.end_date,
-          has_no_end_date: next.has_no_end_date, default_price: next.default_price, notes: next.notes, is_demo: old.is_demo, created_by: user.id, status: 'ACTIVE',
-        }).select(RECURRING_SERIES_COLUMNS).maybeSingle()
-        if (sErr || !series) {
-          const { error: revertErr } = await supabase.from('recurring_reservations').update({ status: old.status, end_date: old.end_date, has_no_end_date: old.has_no_end_date }).eq('id', id)
-          if (revertErr) console.error('reschedule revert failed', id, revertErr.message)
-          return json({ error: 'Não foi possível criar a nova série. Nenhuma reserva foi alterada.' }, 400)
+
+        try {
+          // 1) Carrega e autoriza a série de origem (RECEPTIONIST -> 403). A RPC revalida no banco.
+          const old = await loadSeries(supabase, id)
+          if (!old) return json({ error: 'Mensalista não encontrado' }, 404)
+          if (!(await canManageOrg(supabase, user.id, old.organization_id))) return json({ error: 'Sem permissão para reagendar mensalista' }, 403)
+
+          // 2) Retry de reagendamento já confirmado: resolvido ANTES do preview (a série nova ocuparia
+          //    os próprios horários e geraria um needs_decision falso). Escopo = organização da série
+          //    carregada. A RPC decide replay x RGR02.
+          const replayReschedule = async () => {
+            const { data, error } = await supabase.rpc('rg_recurring_reschedule', rescheduleArgs([]))
+            if (error) return rpcErrorResponse(error, rescheduleCtx)
+            return await rescheduleResult(data, null)
+          }
+          if (!body.dry_run && await operationAlreadyRecorded(supabase, old.organization_id, operationId)) return await replayReschedule()
+
+          if (!body.dry_run && from_date < todayInTZ()) return json({ error: 'Não é possível reagendar a partir de uma data passada.' }, 400)
+          // Proposta da nova série (a partir de from_date), só para o preview.
+          const next = {
+            id: null, organization_id: old.organization_id, arena_id: old.arena_id,
+            court_id: body.court_id || old.court_id, customer_id: old.customer_id,
+            frequency: body.frequency || old.frequency,
+            weekday: body.weekday !== undefined ? body.weekday : old.weekday,
+            day_of_month: body.day_of_month !== undefined ? body.day_of_month : old.day_of_month,
+            start_time: body.start_time || old.start_time, end_time: body.end_time || old.end_time,
+            start_date: from_date, end_date: old.end_date, has_no_end_date: old.has_no_end_date,
+            default_price: body.default_price !== undefined ? body.default_price : old.default_price,
+            notes: body.notes !== undefined ? body.notes : old.notes, status: 'ACTIVE',
+          }
+          if (sameTime(next.start_time, next.end_time)) return json({ error: SAME_TIME_MSG }, 400)
+          const today = todayInTZ()
+          const from = next.start_date > today ? next.start_date : today
+          const to = dateAddDays(today, RECUR_WINDOW_DAYS)
+          // Pré-validação ignorando apenas as ocorrências da própria série antiga a partir de from_date.
+          const ignore = { seriesId: id, fromDate: from_date }
+          const prev = await previewOccurrences(supabase, next, from, to, ignore)
+          if (body.dry_run) return json({ toCreate: prev.toCreate.length, conflicts: prev.conflicts })
+          if (prev.conflicts.length && !body.skip_conflicts) {
+            // Double-click: rechecar a chave antes de pedir decisão (ver create).
+            if (await operationAlreadyRecorded(supabase, old.organization_id, operationId)) return await replayReschedule()
+            return json({ error: 'Conflitos encontrados', conflicts: prev.conflicts, toCreate: prev.toCreate.length, needs_decision: true }, 409)
+          }
+
+          const { data, error } = await supabase.rpc('rg_recurring_reschedule', rescheduleArgs(prev.toCreate))
+          if (error) {
+            if (error.code === '23P01' && !body.skip_conflicts) {
+              const again = await previewOccurrences(supabase, next, from, to, ignore)
+              if (again.conflicts.length) return json({ error: 'Conflitos encontrados', conflicts: again.conflicts, toCreate: again.toCreate.length, needs_decision: true }, 409)
+            }
+            return rpcErrorResponse(error, rescheduleCtx)
+          }
+          return await rescheduleResult(data, prev)
+        } catch (e) {
+          if (e instanceof PreviewUnavailableError) return json({ error: PREVIEW_UNAVAILABLE_MSG }, 503)
+          throw e
         }
-        // 5) Só agora cancela as ocorrências futuras da série antiga e materializa a nova.
-        let cancelled = 0
-        try { cancelled = await cancelFutureOccurrences(supabase, id, from_date) }
-        catch (e) {
-          console.error('reschedule cancel failed', id, e?.message)
-          return json({ error: 'Nova série criada, mas não foi possível liberar as reservas antigas. Revise o mensalista.', id: series.id }, 500)
-        }
-        const mat = await materialize(supabase, { ...next, id: series.id }, prev.toCreate, user.id)
-        await supabase.from('audit_logs').insert({ organization_id: series.organization_id, user_id: user.id, action: 'RECURRING_RESERVATION_UPDATED', entity_type: 'recurring_reservation', entity_id: id, metadata: { rescheduled_from: from_date, new_series: series.id, created: mat.created.length, cancelled_future: cancelled } })
-        return json({ id: series.id, series, previous: id, created: mat.created.length, ignored: prev.conflicts, skipped: mat.skipped }, 201)
       }
     }
-
 
     return json({ error: `Rota /${path.join('/')} não encontrada` }, 404)
   } catch (error) {

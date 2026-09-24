@@ -1,9 +1,10 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { useMe } from '@/components/reserva/dashboard-shell'
 import { isManagerOrAbove } from '@/lib/auth/permissions'
 import { fmtDateTimeLong } from '@/lib/reserva/time'
+import { newOperationId } from '@/lib/reserva/operation-id'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -154,6 +155,8 @@ function CreateDialog({ orgId, arena, courts, onClose, onCreated }) {
   const [f, setF] = useState({ court_id: courts[0]?.id || '', frequency: 'WEEKLY', weekday: '3', day_of_month: '10', start_time: '20:00', end_time: '21:00', start_date: todayStr, end_date: '', has_no_end_date: true, price: '', notes: '', name: '', phone: '' })
   const [preview, setPreview] = useState(null)
   const [busy, setBusy] = useState(false)
+  // B3: uma chave por intenção de criação; reutilizada em retry/needs_decision; some ao fechar.
+  const operationIdRef = useRef(null)
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }))
 
   const body = () => ({
@@ -176,12 +179,16 @@ function CreateDialog({ orgId, arena, courts, onClose, onCreated }) {
   }
 
   async function create(skip_conflicts) {
+    if (!operationIdRef.current) {
+      try { operationIdRef.current = newOperationId() } catch { toast.error('Não foi possível iniciar a operação neste navegador'); return }
+    }
     setBusy(true)
-    const r = await fetch('/api/recurring-reservations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body(), skip_conflicts }) })
+    const r = await fetch('/api/recurring-reservations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body(), skip_conflicts, operation_id: operationIdRef.current }) })
     const d = await r.json().catch(() => ({}))
     setBusy(false)
-    if (r.status === 409) { setPreview({ toCreate: d.toCreate, conflicts: d.conflicts, needs_decision: true }); return }
+    if (r.status === 409 && d.needs_decision) { setPreview({ toCreate: d.toCreate, conflicts: d.conflicts, needs_decision: true }); return }
     if (!r.ok) { toast.error(d.error || 'Não foi possível criar'); return }
+    if (d.idempotent) { toast.success('Mensalista já criado'); onCreated(); return }
     toast.success(`Mensalista criado — ${d.created} reserva(s) gerada(s)${d.ignored?.length ? `, ${d.ignored.length} ignorada(s)` : ''}`)
     onCreated()
   }

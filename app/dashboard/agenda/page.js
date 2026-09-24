@@ -7,6 +7,7 @@ import { EmptyState } from '@/components/reserva/empty-state'
 import { STATUS_META, RESERVATION_STATUSES, SOURCES, BLOCK_REASONS, statusMeta } from '@/lib/reserva/status'
 import { buildSlots, overlaps, fmtTime, fmtDateLong, fmtDateTimeLong, todayStr, addDaysStr, weekdayOf, timeToMin, closeTimeToMin } from '@/lib/reserva/time'
 import { isManagerOrAbove } from '@/lib/auth/permissions'
+import { newOperationId } from '@/lib/reserva/operation-id'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -435,6 +436,8 @@ function RescheduleDialog({ res, courts, onClose, onDone }) {
   const [f, setF] = useState(null)
   const [busy, setBusy] = useState(false)
   const [conflicts, setConflicts] = useState(null)
+  // B3: uma chave por intenção de reagendamento; reutilizada em retry/needs_decision; some ao fechar.
+  const operationIdRef = useRef(null)
   useEffect(() => {
     fetch(`/api/recurring-reservations/${res.recurring_reservation_id}`).then((r) => r.json()).then((s) => {
       setSeries(s)
@@ -445,12 +448,16 @@ function RescheduleDialog({ res, courts, onClose, onDone }) {
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }))
   const payload = (extra) => ({ from_date: fromDate, court_id: f.court_id, start_time: f.start_time, end_time: f.end_time, weekday: series.frequency === 'MONTHLY' ? null : Number(f.weekday), day_of_month: series.frequency === 'MONTHLY' ? Number(f.day_of_month) : null, ...extra })
   async function apply(skip) {
+    if (!operationIdRef.current) {
+      try { operationIdRef.current = newOperationId() } catch { toast.error('Não foi possível iniciar a operação neste navegador'); return }
+    }
     setBusy(true)
-    const r = await fetch(`/api/recurring-reservations/${res.recurring_reservation_id}/reschedule`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload({ skip_conflicts: skip })) })
+    const r = await fetch(`/api/recurring-reservations/${res.recurring_reservation_id}/reschedule`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload({ skip_conflicts: skip, operation_id: operationIdRef.current })) })
     const d = await r.json().catch(() => ({}))
     setBusy(false)
-    if (r.status === 409) { setConflicts(d.conflicts || []); return }
+    if (r.status === 409 && d.needs_decision) { setConflicts(d.conflicts || []); return }
     if (!r.ok) { toast.error(d.error || 'Não foi possível reagendar'); return }
+    if (d.idempotent) { toast.success('Reagendamento já aplicado'); onDone(); return }
     toast.success(`Série atualizada a partir de ${fromDate} — ${d.created} reserva(s)`); onDone()
   }
   return (
