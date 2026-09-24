@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createClient as createTokenClient } from '@supabase/supabase-js'
 import { createClient } from '@/lib/supabase/server'
 import { createAdminClient } from '@/lib/supabase/admin'
+import { timeToMin, closeTimeToMin, crossesMidnight, intervalEndMin, buildSlots, overlaps } from '@/lib/reserva/time'
 
 function json(data, status = 200) {
   const res = NextResponse.json(data, { status })
@@ -107,10 +108,21 @@ function dateAddDays(dateStr, n) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: ARENA_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(next)
 }
 function daysInMonth(y, m) { return new Date(Date.UTC(y, m, 0)).getUTCDate() } // m 1-based
-function timeToMin(t) { const [h, m] = (t || '0:0').split(':').map(Number); return h * 60 + (m || 0) }
-// Recorrência pode terminar após a meia-noite: end_time <= start_time significa "dia seguinte".
-function crossesMidnight(startT, endT) { return timeToMin(endT) <= timeToMin(startT) }
+// Intervalo pode terminar após a meia-noite: end_time < start_time significa "dia seguinte"
+// (regra única em lib/reserva/time). end_time = start_time é inválido e é barrado antes.
 function endISO(date, startT, endT) { return crossesMidnight(startT, endT) ? toISO(dateAddDays(date, 1), endT) : toISO(date, endT) }
+function sameTime(startT, endT) { return timeToMin(startT) === timeToMin(endT) }
+const SAME_TIME_MSG = 'Horário final não pode ser igual ao inicial'
+
+// OWNER/MANAGER da organização (ou admin da plataforma). Consulta com o client do usuário (RLS).
+async function canManageOrg(supabase, userId, organizationId) {
+  if (!organizationId) return false
+  const { data: mem } = await supabase.from('organization_members').select('role')
+    .eq('user_id', userId).eq('organization_id', organizationId).eq('status', 'ACTIVE').maybeSingle()
+  if (mem && ['OWNER', 'MANAGER'].includes(mem.role)) return true
+  const { data: prof } = await supabase.from('profiles').select('is_platform_admin').eq('id', userId).maybeSingle()
+  return !!prof?.is_platform_admin
+}
 
 // Compute the anchor dates (YYYY-MM-DD) for a series within [fromDate, toDate].
 function computeAnchors(series, fromDate, toDate) {
@@ -142,7 +154,10 @@ function computeAnchors(series, fromDate, toDate) {
 }
 
 // Dry-run of which anchors can be created vs which conflict. `db` = user-scoped supabase.
-async function previewOccurrences(db, series, fromDate, toDate) {
+// `ignore` = { seriesId, fromDate }: ignora na pré-validação SOMENTE as ocorrências ativas dessa
+// série com start_at >= fromDate (as mesmas que o reschedule cancela). Outras séries e reservas
+// comuns continuam contando. A constraint anti-overlap segue como autoridade final.
+async function previewOccurrences(db, series, fromDate, toDate, ignore = null) {
   const anchors = computeAnchors(series, fromDate, toDate)
   const result = { anchors, toCreate: [], conflicts: [], existing: [] }
   if (!anchors.length) return result
@@ -159,16 +174,20 @@ async function previewOccurrences(db, series, fromDate, toDate) {
   const first = anchors[0], last = anchors[anchors.length - 1]
   const { data: courtRes } = await db.from('reservations').select('start_at,end_at,status,recurring_reservation_id')
     .eq('court_id', series.court_id).neq('status', 'CANCELLED').neq('status', 'NO_SHOW')
-    .gte('start_at', `${first}T00:00:00${ARENA_OFFSET}`).lte('start_at', `${last}T23:59:59${ARENA_OFFSET}`)
-  const active = (courtRes || []).filter((r) => !(series.id && r.recurring_reservation_id === series.id))
+    .gte('start_at', `${dateAddDays(first, -1)}T00:00:00${ARENA_OFFSET}`).lte('start_at', `${last}T23:59:59${ARENA_OFFSET}`) // -1 dia: pega reservas que viram a meia-noite
+  const ignoreFrom = ignore ? new Date(`${ignore.fromDate}T00:00:00${ARENA_OFFSET}`).getTime() : null
+  const active = (courtRes || []).filter((r) => {
+    if (series.id && r.recurring_reservation_id === series.id) return false
+    if (ignore && r.recurring_reservation_id === ignore.seriesId && new Date(r.start_at).getTime() >= ignoreFrom) return false
+    return true
+  })
   const sMin = timeToMin(series.start_time)
-  const eMin = crossesMidnight(series.start_time, series.end_time) ? timeToMin(series.end_time) + 1440 : timeToMin(series.end_time)
+  const eMin = intervalEndMin(series.start_time, series.end_time)
   for (const a of anchors) {
     if (existingSet.has(a)) { result.existing.push(a); continue }
     const bh = hours[weekdayOf(a)]
     if (!bh || bh.closed || !bh.open_time || !bh.close_time) { result.conflicts.push({ date: a, reason: 'Fora do horário de funcionamento' }); continue }
-    let closeMin = timeToMin(bh.close_time); if (closeMin === 0) closeMin = 1440
-    if (sMin < timeToMin(bh.open_time) || eMin > closeMin) { result.conflicts.push({ date: a, reason: 'Fora do horário de funcionamento' }); continue }
+    if (sMin < timeToMin(bh.open_time) || eMin > closeTimeToMin(bh.close_time)) { result.conflicts.push({ date: a, reason: 'Fora do horário de funcionamento' }); continue }
     const aStart = new Date(toISO(a, series.start_time)).getTime()
     const aEnd = new Date(endISO(a, series.start_time, series.end_time)).getTime()
     const clash = active.some((r) => new Date(r.start_at).getTime() < aEnd && new Date(r.end_at).getTime() > aStart)
@@ -201,9 +220,10 @@ async function materialize(db, series, dates, userId) {
 // Cancel future (not yet played) occurrences of a series. Keeps history intact.
 async function cancelFutureOccurrences(db, seriesId, fromDate) {
   const from = fromDate || todayInTZ()
-  const { data } = await db.from('reservations').update({ status: 'CANCELLED' })
+  const { data, error } = await db.from('reservations').update({ status: 'CANCELLED' })
     .eq('recurring_reservation_id', seriesId).neq('status', 'CANCELLED')
     .gte('start_at', `${from}T00:00:00${ARENA_OFFSET}`).select('id')
+  if (error) throw error
   return (data || []).length
 }
 
@@ -606,9 +626,11 @@ async function handleRoute(request, { params }) {
     if (resource === 'reservations') {
       if (id === 'block' && method === 'POST') {
         const body = await readBody(request)
+        if (!body.date || !body.start_time || !body.end_time) return json({ error: 'Dados obrigatórios ausentes' }, 400)
+        if (sameTime(body.start_time, body.end_time)) return json({ error: SAME_TIME_MSG }, 400)
         const { data, error } = await supabase.from('reservations').insert({
           organization_id: body.organization_id, arena_id: body.arena_id, court_id: body.court_id, customer_id: null,
-          start_at: toISO(body.date, body.start_time), end_at: toISO(body.date, body.end_time),
+          start_at: toISO(body.date, body.start_time), end_at: endISO(body.date, body.start_time, body.end_time),
           status: 'BLOCKED', source: 'INTERNAL', notes: body.reason || 'Bloqueio', created_by: user.id,
         }).select().maybeSingle()
         if (error) return json({ error: isConflict(error) ? CONFLICT_MSG : 'Não foi possível bloquear o horário' }, isConflict(error) ? 409 : 400)
@@ -635,8 +657,9 @@ async function handleRoute(request, { params }) {
         if (body.source !== undefined) patch.source = body.source
         if (body.notes !== undefined) patch.notes = body.notes
         if (body.price !== undefined) patch.price = body.price
+        if (body.date && body.start_time && body.end_time && sameTime(body.start_time, body.end_time)) return json({ error: SAME_TIME_MSG }, 400)
         if (body.date && body.start_time) patch.start_at = toISO(body.date, body.start_time)
-        if (body.date && body.end_time) patch.end_at = toISO(body.date, body.end_time)
+        if (body.date && body.end_time) patch.end_at = body.start_time ? endISO(body.date, body.start_time, body.end_time) : toISO(body.date, body.end_time)
         if (body.customer_id !== undefined) patch.customer_id = body.customer_id
         else if (body.customer) { try { patch.customer_id = await resolveCustomerId(supabase, { organization_id: body.organization_id, arena_id: body.arena_id, customer: body.customer }) } catch { return json({ error: 'Não foi possível salvar o cliente' }, 400) } }
         // Editar "apenas esta" ocorrência de uma série marca exceção (mantém vínculo p/ histórico).
@@ -650,11 +673,12 @@ async function handleRoute(request, { params }) {
       if (method === 'POST') {
         const body = await readBody(request)
         if (!body.organization_id || !body.arena_id || !body.court_id || !body.date || !body.start_time || !body.end_time) return json({ error: 'Dados obrigatórios ausentes' }, 400)
+        if (sameTime(body.start_time, body.end_time)) return json({ error: SAME_TIME_MSG }, 400)
         let customer_id = null
         try { customer_id = await resolveCustomerId(supabase, body) } catch { return json({ error: 'Não foi possível salvar o cliente' }, 400) }
         const { data, error } = await supabase.from('reservations').insert({
           organization_id: body.organization_id, arena_id: body.arena_id, court_id: body.court_id, customer_id,
-          start_at: toISO(body.date, body.start_time), end_at: toISO(body.date, body.end_time),
+          start_at: toISO(body.date, body.start_time), end_at: endISO(body.date, body.start_time, body.end_time),
           status: body.status || 'CONFIRMED', source: body.source || 'RECEPÇÃO', notes: body.notes || null, created_by: user.id,
         }).select('*, customer:customers(id,name,phone), court:courts(id,name)').maybeSingle()
         if (error) return json({ error: isConflict(error) ? CONFLICT_MSG : 'Não foi possível criar a reserva' }, isConflict(error) ? 409 : 400)
@@ -698,7 +722,7 @@ async function handleRoute(request, { params }) {
         if ((body.frequency === 'WEEKLY' || body.frequency === 'BIWEEKLY') && (body.weekday === undefined || body.weekday === null)) return json({ error: 'Selecione o dia da semana' }, 400)
         if (body.frequency === 'MONTHLY' && !body.day_of_month) return json({ error: 'Selecione o dia do mês' }, 400)
         if (!body.has_no_end_date && !body.end_date) return json({ error: 'Informe a data final ou marque "sem data final"' }, 400)
-        if (timeToMin(body.end_time) === timeToMin(body.start_time)) return json({ error: 'Horário final não pode ser igual ao inicial' }, 400)
+        if (sameTime(body.start_time, body.end_time)) return json({ error: SAME_TIME_MSG }, 400)
 
         let customer_id = body.customer_id || null
         if (!customer_id && body.customer) { try { customer_id = await resolveCustomerId(supabase, { organization_id: body.organization_id, arena_id: body.arena_id, customer: body.customer }) } catch { return json({ error: 'Não foi possível salvar o cliente' }, 400) } }
@@ -823,12 +847,17 @@ async function handleRoute(request, { params }) {
       }
 
       // POST /recurring-reservations/:id/reschedule  -> "esta e as próximas"
+      // Ordem segura: permissão -> pré-validação -> encerra série antiga -> cria nova série
+      // (restaura a antiga se falhar) -> só então cancela ocorrências futuras -> materializa.
+      // Ainda NÃO é atômico (sem transação/RPC): dívida técnica registrada.
       if (method === 'POST' && id && sub === 'reschedule') {
         const body = await readBody(request)
         const from_date = body.from_date
         if (!from_date) return json({ error: 'from_date é obrigatório' }, 400)
         const { data: old } = await supabase.from('recurring_reservations').select('*').eq('id', id).maybeSingle()
         if (!old) return json({ error: 'Mensalista não encontrado' }, 404)
+        // 1) Permissão ANTES de qualquer alteração (RECEPTIONIST -> 403, nada é tocado).
+        if (!(await canManageOrg(supabase, user.id, old.organization_id))) return json({ error: 'Sem permissão para reagendar mensalista' }, 403)
         // Nova série (a partir de from_date) copiando campos e aplicando mudanças.
         const next = {
           id: null, organization_id: old.organization_id, arena_id: old.arena_id,
@@ -841,32 +870,42 @@ async function handleRoute(request, { params }) {
           default_price: body.default_price !== undefined ? body.default_price : old.default_price,
           notes: body.notes !== undefined ? body.notes : old.notes, status: 'ACTIVE',
         }
-        if (timeToMin(next.end_time) === timeToMin(next.start_time)) return json({ error: 'Horário final não pode ser igual ao inicial' }, 400)
+        if (sameTime(next.start_time, next.end_time)) return json({ error: SAME_TIME_MSG }, 400)
         const today = todayInTZ()
         const from = next.start_date > today ? next.start_date : today
         const to = dateAddDays(today, RECUR_WINDOW_DAYS)
-        const prev = await previewOccurrences(supabase, next, from, to)
+        // 2) Pré-validação ignorando apenas as ocorrências da própria série antiga a partir de from_date.
+        const prev = await previewOccurrences(supabase, next, from, to, { seriesId: id, fromDate: from_date })
         if (body.dry_run) return json({ toCreate: prev.toCreate.length, conflicts: prev.conflicts })
         if (prev.conflicts.length && !body.skip_conflicts) return json({ error: 'Conflitos encontrados', conflicts: prev.conflicts, toCreate: prev.toCreate.length, needs_decision: true }, 409)
-        // Aplica: encerra série antiga em from_date-1, cancela ocorrências futuras dela, cria nova série.
+        // 3) Encerra a série antiga em from_date-1 (ou cancela, se reagendada desde o início).
+        //    RLS filtra UPDATE sem erro: exigir a linha de volta; sem ela, PARA aqui.
         const oldEnd = dateAddDays(from_date, -1)
-        if (oldEnd < old.start_date) {
-          // Reagendamento a partir do (ou antes do) início: a série antiga deixa de existir logicamente.
-          await supabase.from('recurring_reservations').update({ status: 'CANCELLED' }).eq('id', id)
-        } else {
-          await supabase.from('recurring_reservations').update({ end_date: oldEnd, has_no_end_date: false }).eq('id', id)
-        }
-        await cancelFutureOccurrences(supabase, id, from_date)
+        const oldPatch = oldEnd < old.start_date ? { status: 'CANCELLED' } : { end_date: oldEnd, has_no_end_date: false }
+        const { data: oldUpd, error: oldErr } = await supabase.from('recurring_reservations').update(oldPatch).eq('id', id).select('id').maybeSingle()
+        if (oldErr || !oldUpd) return json({ error: 'Não foi possível atualizar a série atual. Nenhuma reserva foi alterada.' }, 403)
+        // 4) Cria a nova série. Se falhar, restaura a antiga e para (nenhuma ocorrência foi cancelada).
         const { data: series, error: sErr } = await supabase.from('recurring_reservations').insert({
           organization_id: next.organization_id, arena_id: next.arena_id, court_id: next.court_id, customer_id: next.customer_id,
           frequency: next.frequency, weekday: next.weekday, day_of_month: next.day_of_month,
           start_time: next.start_time, end_time: next.end_time, start_date: next.start_date, end_date: next.end_date,
           has_no_end_date: next.has_no_end_date, default_price: next.default_price, notes: next.notes, is_demo: old.is_demo, created_by: user.id, status: 'ACTIVE',
         }).select().maybeSingle()
-        if (sErr || !series) return json({ error: 'Sem permissão para reagendar' }, 403)
+        if (sErr || !series) {
+          const { error: revertErr } = await supabase.from('recurring_reservations').update({ status: old.status, end_date: old.end_date, has_no_end_date: old.has_no_end_date }).eq('id', id)
+          if (revertErr) console.error('reschedule revert failed', id, revertErr.message)
+          return json({ error: 'Não foi possível criar a nova série. Nenhuma reserva foi alterada.' }, 400)
+        }
+        // 5) Só agora cancela as ocorrências futuras da série antiga e materializa a nova.
+        let cancelled = 0
+        try { cancelled = await cancelFutureOccurrences(supabase, id, from_date) }
+        catch (e) {
+          console.error('reschedule cancel failed', id, e?.message)
+          return json({ error: 'Nova série criada, mas não foi possível liberar as reservas antigas. Revise o mensalista.', id: series.id }, 500)
+        }
         const mat = await materialize(supabase, { ...next, id: series.id }, prev.toCreate, user.id)
-        await supabase.from('audit_logs').insert({ organization_id: series.organization_id, user_id: user.id, action: 'RECURRING_RESERVATION_UPDATED', entity_type: 'recurring_reservation', entity_id: id, metadata: { rescheduled_from: from_date, new_series: series.id, created: mat.created.length } })
-        return json({ id: series.id, series, previous: id, created: mat.created.length, ignored: prev.conflicts }, 201)
+        await supabase.from('audit_logs').insert({ organization_id: series.organization_id, user_id: user.id, action: 'RECURRING_RESERVATION_UPDATED', entity_type: 'recurring_reservation', entity_id: id, metadata: { rescheduled_from: from_date, new_series: series.id, created: mat.created.length, cancelled_future: cancelled } })
+        return json({ id: series.id, series, previous: id, created: mat.created.length, ignored: prev.conflicts, skipped: mat.skipped }, 201)
       }
     }
 
@@ -888,8 +927,6 @@ export const DELETE = handleRoute
 const RL = new Map()
 function rateLimited(key) { const now = Date.now(); const arr = (RL.get(key) || []).filter((t) => now - t < 60000); arr.push(now); RL.set(key, arr); return arr.length > 12 }
 function genCode() { const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; for (let i = 0; i < 6; i++) s += a[Math.floor(Math.random() * a.length)]; return 'RG-' + s }
-function pubSlots(open, close, step) { const pm = (t) => { const [h, m] = (t || '0:0').split(':').map(Number); return h * 60 + (m || 0) }; const hh = (x) => `${String(Math.floor(x / 60)).padStart(2, '0')}:${String(x % 60).padStart(2, '0')}`; const out = []; let c = pm(open); const e = pm(close); step = step || 60; while (c + step <= e) { out.push({ start: hh(c), end: hh(c + step), sMin: c, eMin: c + step }); c += step } return out }
-function minsTZ(iso) { const p = new Intl.DateTimeFormat('en-GB', { timeZone: ARENA_TZ, hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(new Date(iso)); let h = 0, m = 0; for (const x of p) { if (x.type === 'hour') h = +x.value; if (x.type === 'minute') m = +x.value } return h * 60 + m }
 
 async function loadPublicArena(admin, slug) {
   const { data } = await admin.from('arenas').select('*').eq('slug', slug).eq('active', true).eq('public_booking_enabled', true).maybeSingle()
@@ -938,10 +975,9 @@ async function handlePublic(request, id, sub, method) {
       const weekday = new Date(`${date}T12:00:00${ARENA_OFFSET}`).getUTCDay()
       const { data: bh } = await admin.from('business_hours').select('*').eq('arena_id', a.id).eq('weekday', weekday).maybeSingle()
       if (!bh || bh.closed) return json({ closed: true, slots: [] })
-      const slots = pubSlots(bh.open_time, bh.close_time, org?.default_reservation_minutes || 60)
+      const slots = buildSlots(bh.open_time, bh.close_time, org?.default_reservation_minutes || 60) // close 00:00 = meia-noite
       const { data: res } = await admin.from('reservations').select('start_at,end_at,status').eq('court_id', court_id).neq('status', 'CANCELLED').gte('start_at', `${date}T00:00:00${ARENA_OFFSET}`).lte('start_at', `${date}T23:59:59${ARENA_OFFSET}`)
-      const busy = (res || []).map((r) => [minsTZ(r.start_at), minsTZ(r.end_at)])
-      const out = slots.map((s) => ({ start: s.start, end: s.end, available: !busy.some(([bs, be]) => bs < s.eMin && be > s.sMin) }))
+      const out = slots.map((s) => ({ start: s.start, end: s.end, available: !(res || []).some((r) => overlaps(r, s.startMin, s.endMin)) }))
       return json({ closed: false, slots: out })
     }
     if (id === 'reserve' && method === 'POST') {
@@ -950,6 +986,7 @@ async function handlePublic(request, id, sub, method) {
       if (rateLimited(`${ip}:${normalizePhone(body.phone)}`)) return json({ error: 'Muitas tentativas. Aguarde um instante e tente novamente.' }, 429)
       if (!body.slug || !body.court_id || !body.date || !body.start_time || !body.end_time || !body.name || !body.phone) return json({ error: 'Dados obrigatórios ausentes' }, 400)
       if (!body.accept_terms) return json({ error: 'É necessário aceitar as regras da arena.' }, 400)
+      if (sameTime(body.start_time, body.end_time)) return json({ error: SAME_TIME_MSG }, 400)
       const a = await loadPublicArena(admin, body.slug)
       if (!a) return json({ error: 'Arena indisponível' }, 404)
       const { data: court } = await admin.from('courts').select('id').eq('id', body.court_id).eq('arena_id', a.id).eq('active', true).maybeSingle()
@@ -965,7 +1002,7 @@ async function handlePublic(request, id, sub, method) {
       const public_code = genCode()
       const { data: created, error } = await admin.from('reservations').insert({
         organization_id: a.organization_id, arena_id: a.id, court_id: body.court_id, customer_id,
-        start_at: toISO(body.date, body.start_time), end_at: toISO(body.date, body.end_time),
+        start_at: toISO(body.date, body.start_time), end_at: endISO(body.date, body.start_time, body.end_time),
         status: 'CONFIRMED', source: 'PUBLIC_WEB', notes: null, public_code, idempotency_key: body.idempotency_key || null,
       }).select('public_code').maybeSingle()
       if (error) {

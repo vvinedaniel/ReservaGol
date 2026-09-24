@@ -11,11 +11,11 @@ import os
 from PIL import Image
 
 # Environment
-BASE_URL = os.getenv('NEXT_PUBLIC_BASE_URL', 'https://reserva-core-setup.preview.emergentagent.com')
+BASE_URL = os.environ['NEXT_PUBLIC_BASE_URL']
 API_URL = f"{BASE_URL}/api"
-SUPABASE_URL = os.getenv('NEXT_PUBLIC_SUPABASE_URL', 'https://khidbemtqybkbywrpllx.supabase.co')
+SUPABASE_URL = os.environ['NEXT_PUBLIC_SUPABASE_URL']
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
-SUPABASE_PUBLISHABLE_KEY = os.getenv('NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY', 'sb_publishable_JgA9Kju8XbZZxF4gruhEYw_T8wYYR1k')
+SUPABASE_PUBLISHABLE_KEY = os.environ['NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY']
 
 print("=" * 80)
 print("PHASE 02B - IMAGE UPLOAD MAGIC BYTE VALIDATION TEST (TEST 2)")
@@ -27,7 +27,7 @@ print("=" * 80)
 
 print("\n[SETUP] Creating test user via Supabase Admin API...")
 test_email = f"image-test-{os.urandom(4).hex()}@reservagol.test"
-test_password = "ReservaGol123"
+test_password = os.environ['TEST_ACCOUNT_PASSWORD']  # sem fallback: definir no ambiente
 
 # Create user via Supabase Admin API
 admin_headers = {
