@@ -11,6 +11,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { MapPin, MessageCircle, Navigation, Goal, Loader2, CheckCircle2, Clock } from 'lucide-react'
 import { toast } from 'sonner'
 import { todayStr, addDaysStr, weekdayOf, fmtDateLong, minsOfDay, isWithinHours } from '@/lib/reserva/time'
+import { publicMaxDate, cleanName, cleanBrPhone, cleanEmail, PUBLIC_ERRORS } from '@/lib/reserva/public-booking'
 
 export default function ArenaPublicPage() {
   const { slug } = useParams()
@@ -26,7 +27,7 @@ export default function ArenaPublicPage() {
     fetch(`/api/public/arena/${slug}`).then((r) => r.ok ? r.json() : Promise.reject()).then((d) => { setArena(d); setCourtId(d.courts?.[0]?.id || '') }).catch(() => setNotFound(true))
   }, [slug])
 
-  const loadAvail = () => { if (slug && courtId && date) fetch(`/api/public/availability?slug=${slug}&court_id=${courtId}&date=${date}`).then((r) => r.json()).then(setAvail) }
+  const loadAvail = () => { if (slug && courtId && date) fetch(`/api/public/availability?slug=${slug}&court_id=${courtId}&date=${date}`).then(async (r) => { const d = await r.json().catch(() => ({})); setAvail(r.ok ? d : { error: d.error || 'Não foi possível carregar os horários.' }) }).catch(() => setAvail({ error: 'Não foi possível carregar os horários.' })) }
   useEffect(() => { setAvail(null); loadAvail(); const iv = setInterval(loadAvail, 10000); return () => clearInterval(iv) }, [slug, courtId, date])
 
   const openNow = useMemo(() => {
@@ -61,11 +62,12 @@ export default function ArenaPublicPage() {
           <h2 className="font-display text-lg font-semibold">Ver horários</h2>
           <div className="mt-3 grid grid-cols-2 gap-3">
             <div><Label className="text-xs">Quadra</Label><Select value={courtId} onValueChange={setCourtId}><SelectTrigger className="mt-1"><SelectValue placeholder="Quadra" /></SelectTrigger><SelectContent>{arena.courts.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}</SelectContent></Select></div>
-            <div><Label className="text-xs">Data</Label><Input type="date" value={date} min={todayStr()} onChange={(e) => setDate(e.target.value)} className="mt-1" /></div>
+            <div><Label className="text-xs">Data</Label><Input type="date" value={date} min={todayStr()} max={publicMaxDate(todayStr())} onChange={(e) => setDate(e.target.value)} className="mt-1" /></div>
           </div>
           <p className="mt-3 text-xs capitalize text-muted-foreground">{fmtDateLong(date)}</p>
           <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
             {avail === null ? Array.from({ length: 8 }).map((_, i) => <Skeleton key={i} className="h-11" />)
+              : avail.error ? <p className="col-span-full py-6 text-center text-sm text-muted-foreground">{avail.error}</p>
               : avail.closed ? <p className="col-span-full py-6 text-center text-sm text-muted-foreground">Fechado nesta data.</p>
               : avail.slots.length === 0 ? <p className="col-span-full py-6 text-center text-sm text-muted-foreground">Sem horários para esta data.</p>
               : avail.slots.map((s) => (
@@ -87,8 +89,10 @@ function ReserveDialog({ arena, slug, courtId, date, slot, onClose, onDone }) {
   const [saving, setSaving] = useState(false)
   const [key] = useState(() => (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()))
   async function submit() {
-    if (!f.name.trim() || !f.phone.trim()) { toast.error('Preencha nome e WhatsApp'); return }
-    if (!f.accept) { toast.error('Aceite as regras para continuar'); return }
+    if (!cleanName(f.name)) { toast.error(PUBLIC_ERRORS.name); return }
+    if (!cleanBrPhone(f.phone)) { toast.error(PUBLIC_ERRORS.phone); return }
+    if (!cleanEmail(f.email).ok) { toast.error(PUBLIC_ERRORS.email); return }
+    if (!f.accept) { toast.error(PUBLIC_ERRORS.terms); return }
     setSaving(true)
     const r = await fetch('/api/public/reserve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ slug, court_id: courtId, date, start_time: slot.start, end_time: slot.end, name: f.name, phone: f.phone, email: f.email, accept_terms: f.accept, idempotency_key: key }) })
     const d = await r.json().catch(() => ({}))
@@ -103,9 +107,9 @@ function ReserveDialog({ arena, slug, courtId, date, slot, onClose, onDone }) {
         <DialogHeader><DialogTitle>Confirmar reserva</DialogTitle></DialogHeader>
         <div className="rounded-lg border border-border bg-muted/30 p-3 text-sm"><p><b>{arena.name}</b></p><p className="text-muted-foreground">{court?.name} · {date} · {slot.start}–{slot.end}</p></div>
         <div className="space-y-3">
-          <div className="space-y-1.5"><Label>Nome completo</Label><Input value={f.name} onChange={(e) => setF((s) => ({ ...s, name: e.target.value }))} placeholder="Seu nome" /></div>
-          <div className="space-y-1.5"><Label>WhatsApp</Label><Input value={f.phone} onChange={(e) => setF((s) => ({ ...s, phone: e.target.value }))} placeholder="(11) 90000-0000" /></div>
-          <div className="space-y-1.5"><Label>E-mail (opcional)</Label><Input value={f.email} onChange={(e) => setF((s) => ({ ...s, email: e.target.value }))} placeholder="voce@email.com" /></div>
+          <div className="space-y-1.5"><Label>Nome completo</Label><Input value={f.name} onChange={(e) => setF((s) => ({ ...s, name: e.target.value }))} placeholder="Seu nome" maxLength={80} autoComplete="name" /></div>
+          <div className="space-y-1.5"><Label>WhatsApp</Label><Input value={f.phone} onChange={(e) => setF((s) => ({ ...s, phone: e.target.value }))} placeholder="(11) 90000-0000" maxLength={20} inputMode="tel" autoComplete="tel" /></div>
+          <div className="space-y-1.5"><Label>E-mail (opcional)</Label><Input type="email" value={f.email} onChange={(e) => setF((s) => ({ ...s, email: e.target.value }))} placeholder="voce@email.com" maxLength={254} autoComplete="email" /></div>
           <label className="flex items-start gap-2 text-sm text-muted-foreground"><input type="checkbox" checked={f.accept} onChange={(e) => setF((s) => ({ ...s, accept: e.target.checked }))} className="mt-0.5 h-4 w-4 accent-[#19C463]" />Li e concordo com as regras da arena e com os termos aplicáveis.</label>
         </div>
         <DialogFooter><Button variant="ghost" onClick={onClose}>Cancelar</Button><Button onClick={submit} disabled={saving}>{saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}Confirmar reserva</Button></DialogFooter>
