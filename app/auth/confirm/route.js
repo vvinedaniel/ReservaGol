@@ -1,13 +1,14 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
+import { safeInternalRedirect } from '@/lib/auth/safe-redirect'
 
 // Verifies email confirmation / password recovery links.
 export async function GET(request) {
   const url = new URL(request.url)
   const token_hash = url.searchParams.get('token_hash')
   const type = url.searchParams.get('type')
-  const next = url.searchParams.get('next') || '/dashboard'
-  const safeNext = next.startsWith('/') ? next : '/dashboard'
+  // B1: só destinos internos (bloqueia //evil, /\evil, https://..., javascript:, etc.).
+  const safeNext = safeInternalRedirect(url.searchParams.get('next'), '/dashboard')
 
   const supabase = await createClient()
 

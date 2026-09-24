@@ -6,12 +6,9 @@ import { timeToMin, closeTimeToMin, crossesMidnight, intervalEndMin, buildSlots,
 import { RATE_LIMITS, clientIp, consumeRateLimit } from '@/lib/reserva/rate-limit'
 import { PUBLIC_ERRORS, isUuid, isValidSlug, isHHMM, isRealDate, checkPublicDate, safeSlotMinutes, publicSlots, findSlot, slotStarted, cleanName, cleanBrPhone, cleanEmail, cleanIdempotencyKey } from '@/lib/reserva/public-booking'
 
+// B1: sem headers CORS — a API só é consumida pelo próprio frontend (mesma origem).
 function json(data, status = 200) {
-  const res = NextResponse.json(data, { status })
-  res.headers.set('Access-Control-Allow-Origin', process.env.CORS_ORIGINS || '*')
-  res.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS')
-  res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-  return res
+  return NextResponse.json(data, { status })
 }
 
 export async function OPTIONS() {
