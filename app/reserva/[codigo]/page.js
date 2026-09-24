@@ -13,7 +13,7 @@ export default function PublicReservationPage() {
   const [res, setRes] = useState(undefined)
 
   useEffect(() => {
-    fetch(`/api/public/reservation/${codigo}`).then((r) => r.ok ? r.json() : null).then(setRes).catch(() => setRes(null))
+    fetch(`/api/public/reservation/${encodeURIComponent(codigo)}`, { cache: 'no-store' }).then((r) => r.ok ? r.json() : null).then(setRes).catch(() => setRes(null))
   }, [codigo])
 
   if (res === undefined) return <div className="container max-w-md py-16"><Skeleton className="h-64 w-full" /></div>
@@ -48,10 +48,9 @@ export default function PublicReservationPage() {
 
         <div className="mt-6 rounded-xl border border-border bg-card p-4 text-sm">
           <Row l="Arena" v={a.name} />
-          <Row l="Quadra" v={res.court} />
+          <Row l="Quadra" v={res.court?.name} />
           <Row l="Data" v={fmtDateTimeLong(res.start_at)} />
           <Row l="Horário" v={`${fmtTime(res.start_at)} – ${fmtTime(res.end_at)}`} />
-          {res.customer_name && <Row l="Reservado por" v={res.customer_name} />}
           <Row l="Endereço" v={[a.address, a.number, a.neighborhood, a.city, a.state].filter(Boolean).join(', ')} />
         </div>
 

@@ -940,6 +940,12 @@ export const DELETE = handleRoute
 // ============================ PHASE 02B: PUBLIC API ============================
 const RL = new Map()
 function rateLimited(key) { const now = Date.now(); const arr = (RL.get(key) || []).filter((t) => now - t < 60000); arr.push(now); RL.set(key, arr); return arr.length > 12 }
+// Resposta pública que nunca deve ser guardada em cache (navegador, proxy ou CDN).
+function jsonNoStore(data, status = 200) {
+  const res = json(data, status)
+  res.headers.set('Cache-Control', 'no-store')
+  return res
+}
 function genCode() { const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; for (let i = 0; i < 6; i++) s += a[Math.floor(Math.random() * a.length)]; return 'RG-' + s }
 
 async function loadPublicArena(admin, slug) {
@@ -1061,9 +1067,23 @@ async function handlePublic(request, id, sub, method) {
       return json({ public_code }, 201)
     }
     if (id === 'reservation' && sub && method === 'GET') {
-      const { data: r } = await admin.from('reservations').select('public_code,start_at,end_at,status,customer:customers(name),court:courts(name),arena:arenas(name,slug,address,number,neighborhood,city,state,whatsapp,latitude,longitude)').eq('public_code', sub).maybeSingle()
-      if (!r) return json({ error: 'Reserva não encontrada' }, 404)
-      return json({ public_code: r.public_code, start_at: r.start_at, end_at: r.end_at, status: r.status, customer_name: r.customer?.name || null, court: r.court?.name || null, arena: r.arena || null })
+      // A5: sem identidade de cliente (o customer_id pode ser um cadastro pré-existente
+      // reaproveitado pelo telefone). Só reservas realmente públicas; allowlist explícita;
+      // mesmo 404 para código inexistente ou não público; nunca em cache.
+      const { data: r } = await admin.from('reservations')
+        .select('public_code,start_at,end_at,status,court:courts(name),arena:arenas(name,slug,address,number,neighborhood,city,state,whatsapp,latitude,longitude)')
+        .eq('public_code', sub).eq('source', 'PUBLIC_WEB').maybeSingle()
+      if (!r) return jsonNoStore({ error: 'Reserva não encontrada' }, 404)
+      const a = r.arena || {}
+      return jsonNoStore({
+        public_code: r.public_code, start_at: r.start_at, end_at: r.end_at, status: r.status,
+        court: { name: r.court?.name ?? null },
+        arena: {
+          name: a.name ?? null, slug: a.slug ?? null, address: a.address ?? null, number: a.number ?? null,
+          neighborhood: a.neighborhood ?? null, city: a.city ?? null, state: a.state ?? null,
+          whatsapp: a.whatsapp ?? null, latitude: a.latitude ?? null, longitude: a.longitude ?? null,
+        },
+      })
     }
     return json({ error: 'Rota pública não encontrada' }, 404)
   } catch (e) {
