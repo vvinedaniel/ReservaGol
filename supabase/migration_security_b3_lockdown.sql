@@ -1,5 +1,5 @@
 -- =============================================================================
--- RESERVA GOL — SECURITY HARDENING B3 — LOCKDOWN (Revision 3.1)
+-- RESERVA GOL — SECURITY HARDENING B3 — LOCKDOWN (Revision 3.2: revoke explícito por coluna)
 -- DRAFT PARA REVISÃO. ETAPA 4 do rollout, AINDA DENTRO da janela de manutenção
 -- (iniciada na ETAPA 1). Aplicar SOMENTE depois que:
 --   0) o route usar allowlist de colunas em recurring_reservations (ETAPA 0);
@@ -39,9 +39,17 @@
 -- =============================================================================
 begin;
 
--- 1) Fronteira: sem escrita direta de authenticated. REVOKE no nível da tabela também
---    remove os privilégios de coluna correspondentes — comportamento do PostgreSQL — ou
---    seja, as allowlists transitórias da FOUNDATION (INSERT = 17 colunas, UPDATE = 5).
+-- 1) Fronteira: sem escrita direta de authenticated.
+--    Revogação EXPLÍCITA e verificável das allowlists transitórias concedidas por coluna na
+--    FOUNDATION (INSERT = 17 colunas, UPDATE = 5), seguida do REVOKE no nível da tabela.
+--    (O PostgreSQL também revoga privilégios de coluna num REVOKE de tabela; a forma explícita
+--    garante o resultado independentemente disso e é conferida pelos testes estáticos B3.)
+revoke insert (organization_id, arena_id, court_id, customer_id, frequency, weekday, day_of_month,
+               start_time, end_time, start_date, end_date, has_no_end_date, status, default_price,
+               notes, is_demo, created_by)
+  on public.recurring_reservations from authenticated;
+revoke update (notes, default_price, end_date, has_no_end_date, status)
+  on public.recurring_reservations from authenticated;
 revoke insert, update on public.recurring_reservations from authenticated;
 -- Reafirma o que o A3/02C já garantiam.
 revoke delete, truncate, references, trigger on public.recurring_reservations from authenticated;

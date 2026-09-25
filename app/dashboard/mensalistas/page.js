@@ -183,14 +183,21 @@ function CreateDialog({ orgId, arena, courts, onClose, onCreated }) {
       try { operationIdRef.current = newOperationId() } catch { toast.error('Não foi possível iniciar a operação neste navegador'); return }
     }
     setBusy(true)
-    const r = await fetch('/api/recurring-reservations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body(), skip_conflicts, operation_id: operationIdRef.current }) })
-    const d = await r.json().catch(() => ({}))
-    setBusy(false)
-    if (r.status === 409 && d.needs_decision) { setPreview({ toCreate: d.toCreate, conflicts: d.conflicts, needs_decision: true }); return }
-    if (!r.ok) { toast.error(d.error || 'Não foi possível criar'); return }
-    if (d.idempotent) { toast.success('Mensalista já criado'); onCreated(); return }
-    toast.success(`Mensalista criado — ${d.created} reserva(s) gerada(s)${d.ignored?.length ? `, ${d.ignored.length} ignorada(s)` : ''}`)
-    onCreated()
+    try {
+      const r = await fetch('/api/recurring-reservations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body(), skip_conflicts, operation_id: operationIdRef.current }) })
+      const d = await r.json().catch(() => ({}))
+      if (r.status === 409 && d.needs_decision) { setPreview({ toCreate: d.toCreate, conflicts: d.conflicts, needs_decision: true }); return }
+      if (!r.ok) { toast.error(d.error || 'Não foi possível criar'); return }
+      if (d.idempotent) { toast.success('Mensalista já criado'); onCreated(); return }
+      toast.success(`Mensalista criado — ${d.created} reserva(s) gerada(s)${d.ignored?.length ? `, ${d.ignored.length} ignorada(s)` : ''}`)
+      onCreated()
+    } catch {
+      // Falha de rede/timeout: o servidor PODE ter confirmado. A chave da intenção é mantida para
+      // que o retry (mesmo botão) reenvie o MESMO operation_id e receba o replay idempotente.
+      toast.error('Não foi possível confirmar a resposta do servidor. Tente novamente.')
+    } finally {
+      setBusy(false)
+    }
   }
 
   return (

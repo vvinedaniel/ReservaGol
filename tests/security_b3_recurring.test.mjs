@@ -189,6 +189,63 @@ await check('B3-15 UI: operation_id por intenção, needs_decision explícito e 
   }
 })
 
+// ------------------------------------------------------------------ LOCKDOWN: revogação explícita por coluna
+const LOCKDOWN = 'supabase/migration_security_b3_lockdown.sql'
+const INSERT_17 = ['organization_id', 'arena_id', 'court_id', 'customer_id', 'frequency', 'weekday', 'day_of_month', 'start_time', 'end_time',
+  'start_date', 'end_date', 'has_no_end_date', 'status', 'default_price', 'notes', 'is_demo', 'created_by']
+const UPDATE_5 = ['notes', 'default_price', 'end_date', 'has_no_end_date', 'status']
+const sqlCode = (s) => s.replace(/--[^\n]*/g, '').replace(/\s+/g, ' ').toLowerCase()
+const colList = (code, re) => { const m = code.match(re); return m ? m[1].split(',').map((c) => c.trim()).sort() : null }
+await check('B3-17 LOCKDOWN revoga EXPLICITAMENTE os 17 grants INSERT e os 5 UPDATE da FOUNDATION (+ revoke de tabela)', () => {
+  if (!exists(LOCKDOWN)) { console.log('      (draft LOCKDOWN ausente neste checkout)'); return 'SKIP' }
+  const code = sqlCode(read(LOCKDOWN))
+  assert.deepEqual(colList(code, /revoke insert \(([^)]+)\) on public\.recurring_reservations from authenticated;/), [...INSERT_17].sort(), 'revoke INSERT por coluna')
+  assert.deepEqual(colList(code, /revoke update \(([^)]+)\) on public\.recurring_reservations from authenticated;/), [...UPDATE_5].sort(), 'revoke UPDATE por coluna')
+  assert.ok(code.includes('revoke insert, update on public.recurring_reservations from authenticated;'), 'revoke de tabela')
+  assert.ok(!/grant (insert|update)[^;]*on public\.recurring_reservations to authenticated/.test(code), 'LOCKDOWN não pode conceder escrita')
+  assert.ok(!/grant select on public\.recurring_reservations/.test(code), 'LOCKDOWN não pode conceder SELECT de tabela')
+  // as listas revogadas batem exatamente com as concedidas na FOUNDATION
+  if (exists(FOUNDATION)) {
+    const f = sqlCode(read(FOUNDATION))
+    assert.deepEqual(colList(f, /grant insert \(([^)]+)\) on public\.recurring_reservations to authenticated;/), [...INSERT_17].sort(), 'FOUNDATION INSERT 17')
+    assert.deepEqual(colList(f, /grant update \(([^)]+)\) on public\.recurring_reservations to authenticated;/), [...UPDATE_5].sort(), 'FOUNDATION UPDATE 5')
+  }
+})
+
+// ------------------------------------------------------------------ UI: retry de rede preserva a idempotência
+function fnBody(src, header) {
+  const i = src.indexOf(header)
+  assert.ok(i >= 0, `função ausente: ${header}`)
+  let depth = 0
+  for (let j = src.indexOf('{', i); j < src.length; j++) {
+    if (src[j] === '{') depth++
+    else if (src[j] === '}' && --depth === 0) return src.slice(i, j + 1)
+  }
+  throw new Error(`corpo não fechado: ${header}`)
+}
+await check('B3-18 create/reschedule: try/catch/finally; catch mantém a chave; finally libera busy; chave gerada uma vez', () => {
+  for (const [file, header] of [['app/dashboard/mensalistas/page.js', 'async function create(skip_conflicts)'], ['app/dashboard/agenda/page.js', 'async function apply(skip)']]) {
+    const src = read(file)
+    const body = fnBody(src, header)
+    const iTry = body.indexOf('try {\n') >= 0 ? body.indexOf('try {\n') : body.indexOf('try {\r\n')
+    const iCatch = body.indexOf('} catch {', iTry)
+    const iFinally = body.indexOf('} finally {', iCatch)
+    assert.ok(iTry > 0 && iCatch > iTry && iFinally > iCatch, `${file}: sem try/catch/finally em volta do fetch`)
+    assert.ok(body.slice(iTry, iCatch).includes('await fetch('), `${file}: fetch fora do try`)
+    const catchBlock = body.slice(iCatch, iFinally)
+    const finallyBlock = body.slice(iFinally)
+    assert.ok(!/operationIdRef\.current\s*=/.test(catchBlock), `${file}: catch altera/limpa a chave`)
+    assert.ok(!/newOperationId\(/.test(catchBlock), `${file}: catch gera outra chave`)
+    assert.ok(/toast\.error\('Não foi possível confirmar a resposta do servidor\. Tente novamente\.'\)/.test(catchBlock), `${file}: mensagem do catch`)
+    assert.ok(finallyBlock.includes('setBusy(false)'), `${file}: finally não libera busy`)
+    assert.equal((body.slice(0, iTry).match(/setBusy\(false\)/g) || []).length + (body.slice(iTry, iFinally).match(/setBusy\(false\)/g) || []).length, 0, `${file}: setBusy(false) fora do finally`)
+    // uma chave por intenção: gerada só se ainda não existe; nenhum outro ponto do arquivo a limpa
+    assert.equal((src.match(/newOperationId\(\)/g) || []).length, 1, `${file}: newOperationId chamado mais de uma vez`)
+    assert.ok(body.indexOf('if (!operationIdRef.current)') < body.indexOf('newOperationId()'), `${file}: chave não é gerada só uma vez`)
+    assert.equal((src.match(/operationIdRef\.current\s*=(?!=)/g) || []).length, 1, `${file}: a chave é atribuída/limpa em outro ponto`)
+  }
+})
+
 // ------------------------------------------------------------------ harnesses oficiais
 await check('B3-16 harnesses: operation_id em todo create/reschedule + limpeza com residual no exit code', () => {
   const H = {
