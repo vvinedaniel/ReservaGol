@@ -17,8 +17,15 @@ Opcional:
   TEST_EMAIL_DOMAIN                     domínio dos e-mails efêmeros (padrão: reservagol.test)
 
 Apenas biblioteca padrão do Python. Uso: python tests/phase2c_closeout.py
+
+B3: create/reschedule de mensalista enviam operation_id (UUID novo por intenção). Chamadas
+públicas enviam X-Forwarded-For de teste (198.18.0.0/15) para que os buckets de rate limit
+sejam rastreáveis. No fim há limpeza verificável (tests/harness_cleanup.py):
+created / cleaned / residual — residual != 0 faz o harness falhar.
 """
+import atexit
 import json
+import random
 import os
 import sys
 import threading
@@ -27,6 +34,8 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import date, datetime, timedelta, timezone
+
+from harness_cleanup import FixtureTracker
 
 REQUIRED = ['BASE_URL', 'SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY', 'SUPABASE_SECRET_KEY', 'TEST_ACCOUNT_PASSWORD']
 missing = [k for k in REQUIRED if not os.environ.get(k)]
@@ -46,6 +55,9 @@ RUN = uuid.uuid4().hex[:8]
 ACTIVE = '(PENDING,CONFIRMED,PAID,BLOCKED)'
 RAW_ERR = ['no_overlap', '23P01', 'exclusion', 'violates', 'duplicate key', 'constraint']
 results = {}
+# Limpeza verificável (created/cleaned/residual): só o que ESTA execução criou.
+FX = FixtureTracker(SB, SECRET)
+atexit.register(FX.cleanup)
 
 
 # ----------------------------------------------------------------------------- http
@@ -66,9 +78,16 @@ def http(method, url, headers=None, body=None):
         return status, None, raw
 
 
-def api(method, path, token=None, body=None):
+def api(method, path, token=None, body=None, headers=None):
     h = {'Authorization': f'Bearer {token}'} if token else {}
-    return http(method, BASE + path, h, body)
+    return http(method, BASE + path, {**h, **(headers or {})}, body)
+
+
+def public_reserve(body):
+    """Reserva pública com IP de teste conhecido (bucket A6 rastreado para a limpeza)."""
+    ip = f'198.{random.randint(18, 19)}.{random.randint(0, 255)}.{random.randint(1, 254)}'
+    FX.public_reserve(ARENA, body.get('phone'), ip)
+    return api('POST', '/public/reserve', None, body, {'X-Forwarded-For': ip})
 
 
 def svc_headers():
@@ -93,6 +112,7 @@ def create_user(label):
     email = f'p2c-{label}-{RUN}@{DOMAIN}'
     s, b, raw = http('POST', f'{SB}/auth/v1/admin/users', svc_headers(), {'email': email, 'password': PASSWORD, 'email_confirm': True})
     assert s in (200, 201), f'create user {s} {raw[:200]}'
+    FX.user(b['id'])
     s, t, raw = http('POST', f'{SB}/auth/v1/token?grant_type=password', {'apikey': PUB_KEY}, {'email': email, 'password': PASSWORD})
     assert s == 200, f'login {s} {raw[:200]}'
     return b['id'], t['access_token']
@@ -177,7 +197,7 @@ s, b, raw = api('POST', '/onboarding', OWNER, {
     'default_reservation_minutes': 60,
 })
 assert s == 200, f'onboarding {s} {raw[:200]}'
-ORG = b['organization_id']
+ORG = FX.org(b['organization_id'], f'P2C Closeout {RUN}')
 rest_post('organization_members', {'organization_id': ORG, 'user_id': manager_id, 'role': 'MANAGER', 'status': 'ACTIVE'})
 rest_post('organization_members', {'organization_id': ORG, 'user_id': recep_id, 'role': 'RECEPTIONIST', 'status': 'ACTIVE'})
 _, arenas, _ = api('GET', f'/arenas?organization_id={ORG}', OWNER)
@@ -199,6 +219,7 @@ def base(**kw):
 
 
 def series(token, court, wd, st, et, start_d, **kw):
+    kw.setdefault('operation_id', str(uuid.uuid4()))  # B3: uma chave por intenção
     return api('POST', '/recurring-reservations', token, base(court_id=court, frequency='WEEKLY', weekday=wd, start_time=st, end_time=et,
                                                                start_date=str(start_d), has_no_end_date=True,
                                                                customer={'name': f'Mensalista {st}', 'phone': f'119800000{st[:2]}'}, **kw))
@@ -262,7 +283,8 @@ def t9_owner():
     old = b['id']
     occ = occurrences(old)
     from_date = occ[2]['occurrence_date']
-    s, r, raw = api('POST', f'/recurring-reservations/{old}/reschedule', OWNER, {'from_date': from_date, 'weekday': 6, 'start_time': '19:00', 'end_time': '20:00', 'court_id': C1})
+    s, r, raw = api('POST', f'/recurring-reservations/{old}/reschedule', OWNER, {'from_date': from_date, 'weekday': 6, 'start_time': '19:00', 'end_time': '20:00', 'court_id': C1,
+                                                                                  'operation_id': str(uuid.uuid4())})
     assert s == 201, f'{s} {raw[:200]}'
     after = occurrences(old)
     kept = [o for o in after if o['occurrence_date'] < from_date]
@@ -285,7 +307,7 @@ def t9_same_slot():
     assert s == 201, raw[:200]
     old = b['id']
     from_date = occurrences(old)[1]['occurrence_date']
-    s, r, raw = api('POST', f'/recurring-reservations/{old}/reschedule', OWNER, {'from_date': from_date, 'default_price': 15000})
+    s, r, raw = api('POST', f'/recurring-reservations/{old}/reschedule', OWNER, {'from_date': from_date, 'default_price': 15000, 'operation_id': str(uuid.uuid4())})
     assert s == 201, f'deveria aplicar sem conflito: {s} {raw[:300]}'
     assert r['ignored'] == [], r['ignored']
     cancelled = [o for o in occurrences(old) if o['status'] == 'CANCELLED']
@@ -297,7 +319,8 @@ def t9_manager():
     s, b, raw = series(OWNER, C2, 2, '12:00', '13:00', d)
     assert s == 201, raw[:200]
     from_date = occurrences(b['id'])[1]['occurrence_date']
-    s, r, raw = api('POST', f'/recurring-reservations/{b["id"]}/reschedule', MANAGER, {'from_date': from_date, 'start_time': '13:00', 'end_time': '14:00'})
+    s, r, raw = api('POST', f'/recurring-reservations/{b["id"]}/reschedule', MANAGER, {'from_date': from_date, 'start_time': '13:00', 'end_time': '14:00',
+                                                                                              'operation_id': str(uuid.uuid4())})
     assert s == 201, f'MANAGER deveria reagendar: {s} {raw[:200]}'
     assert r['created'] > 0
 
@@ -312,7 +335,8 @@ def t9_receptionist():
     n_series_before = len(rest_get('recurring_reservations', {'select': 'id', 'organization_id': f'eq.{ORG}'}))
     from_date = before_active[1]['occurrence_date']
     for extra in ({}, {'skip_conflicts': True}):
-        s, r, raw = api('POST', f'/recurring-reservations/{sid}/reschedule', RECEP, {'from_date': from_date, 'start_time': '09:00', 'end_time': '10:00', **extra})
+        s, r, raw = api('POST', f'/recurring-reservations/{sid}/reschedule', RECEP, {'from_date': from_date, 'start_time': '09:00', 'end_time': '10:00',
+                                                                                     'operation_id': str(uuid.uuid4()), **extra})
         assert s == 403, f'RECEPTIONIST deveria receber 403: {s} {raw[:200]}'
     after_series = rest_get('recurring_reservations', {'select': 'status,end_date,has_no_end_date,updated_at', 'id': f'eq.{sid}'})[0]
     after_active = [o for o in occurrences(sid) if o['status'] != 'CANCELLED']
@@ -385,7 +409,7 @@ def extra_midnight():
     assert s == 201 and local(r['end_at']).date() == x + timedelta(days=2), f'bloqueio {s} {raw[:200]}'
     # (g) reserva pública 23:00 -> 00:00 (contrato do frontend)
     pd = x + timedelta(days=2)
-    s, r, raw = api('POST', '/public/reserve', None, {'slug': SLUG, 'court_id': C2, 'date': str(pd), 'start_time': '23:00', 'end_time': '00:00',
+    s, r, raw = public_reserve({'slug': SLUG, 'court_id': C2, 'date': str(pd), 'start_time': '23:00', 'end_time': '00:00',
                                                       'name': 'Jogador Meia-noite', 'phone': '11966660000', 'email': None, 'accept_terms': True, 'idempotency_key': f'mid-{RUN}'})
     assert s == 201, f'pública {s} {raw[:200]}'
     act = active_at(C2, pd, '23')
@@ -429,7 +453,7 @@ def c4():
     d = cdate(23)
     pub = {'slug': SLUG, 'court_id': C3, 'date': str(d), 'start_time': '14:00', 'end_time': '15:00',
            'name': 'Jogador C4', 'phone': '11955550000', 'email': None, 'accept_terms': True, 'idempotency_key': f'c4-{RUN}'}
-    a, b = race(lambda: api('POST', '/public/reserve', None, pub), lambda: internal(OWNER, C3, d, '14:00', '15:00', 'C4 interna'))
+    a, b = race(lambda: public_reserve(pub), lambda: internal(OWNER, C3, d, '14:00', '15:00', 'C4 interna'))
     assert sorted([a[0], b[0]]) == [201, 409], f'pública={a[0]} {a[2][:120]} | interna={b[0]} {b[2][:120]}'
     loser = a if a[0] == 409 else b
     assert friendly(loser[2]) and 'Dados obrigatórios' not in loser[2], loser[2][:200]
@@ -460,4 +484,5 @@ for name, fn in [
 
 ok = sum(1 for v in results.values() if v == 'PASS')
 print(f'\n== {ok}/{len(results)} PASS (run {RUN}, org {ORG}) ==')
-sys.exit(0 if ok == len(results) else 1)
+residual = FX.cleanup()
+sys.exit(0 if ok == len(results) and residual == 0 else 1)

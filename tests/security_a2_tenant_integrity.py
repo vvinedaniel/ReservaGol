@@ -4,6 +4,16 @@ Reserva Gol — SECURITY HARDENING A2 — integridade multi-tenant (P0-2).
 
 Rodar SOMENTE depois de aplicar supabase/migration_security_a2.sql.
 
+ESTADO B3 — dois modos, escolhidos EXPLICITAMENTE por B3_EXPECT_LOCKDOWN (obrigatório):
+  B3_EXPECT_LOCKDOWN=0  FOUNDATION + route B3 (ETAPA 3, antes do lockdown): authenticated só
+                        grava diretamente as 5 colunas transitórias (notes, default_price,
+                        end_date, has_no_end_date, status); estrutura e metadados B3 -> 42501.
+  B3_EXPECT_LOCKDOWN=1  pós-LOCKDOWN: nenhuma escrita direta em recurring_reservations (42501).
+Nos dois modos: imutabilidade estrutural provada via service_role (RGT02) e via RPC (22023);
+operation_request nunca legível; mutações legítimas pela API -> RPCs B3 com operation_id.
+Nenhum caso "falha de propósito": cada modo tem as expectativas do seu estado.
+Limpeza verificável no fim (tests/harness_cleanup.py): created / cleaned / residual = 0.
+
 Cria DUAS organizações novas e isoladas (is_demo), com usuários efêmeros:
   Org A: Arena A (Quadra A1, Quadra A1b) + Arena A2 (Quadra A2) + Customer A
   Org B: Arena B (Quadra B) + Customer B
@@ -12,11 +22,14 @@ acesso de qualquer navegador logado) e também pela API do app.
 
 Variáveis de ambiente obrigatórias (nenhum valor é impresso):
   BASE_URL, SUPABASE_URL, NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY, SUPABASE_SECRET_KEY, TEST_ACCOUNT_PASSWORD
+Obrigatória também: B3_EXPECT_LOCKDOWN=0|1 (ver acima).
 Opcional: TEST_EMAIL_DOMAIN (padrão reservagol.test)
 
 Uso: python tests/security_a2_tenant_integrity.py
 """
+import atexit
 import json
+import random
 import os
 import sys
 import urllib.error
@@ -25,11 +38,17 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from harness_cleanup import FixtureTracker
+
 REQUIRED = ['BASE_URL', 'SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY', 'SUPABASE_SECRET_KEY', 'TEST_ACCOUNT_PASSWORD']
 missing = [k for k in REQUIRED if not os.environ.get(k)]
 if missing:
     print('Variáveis de ambiente ausentes: ' + ', '.join(missing))
     sys.exit(2)
+if os.environ.get('B3_EXPECT_LOCKDOWN') not in ('0', '1'):
+    print('Defina B3_EXPECT_LOCKDOWN=0 (FOUNDATION + route B3) ou B3_EXPECT_LOCKDOWN=1 (pós-lockdown).')
+    sys.exit(2)
+LOCKDOWN = os.environ['B3_EXPECT_LOCKDOWN'] == '1'
 
 BASE = os.environ['BASE_URL'].rstrip('/') + '/api'
 SB = os.environ['SUPABASE_URL'].rstrip('/')
@@ -44,6 +63,9 @@ ARENA_MSG = 'A arena informada não pertence à mesma organização.'
 RAW_ERR = ['tenant_mismatch', 'RGT01', 'violates', 'constraint', 'duplicate key', 'no_overlap']
 results = {}
 SVC = {'apikey': SECRET, 'Authorization': f'Bearer {SECRET}'}
+# Limpeza verificável (created/cleaned/residual): só o que ESTA execução criou.
+FX = FixtureTracker(SB, SECRET)
+atexit.register(FX.cleanup)
 
 
 def http(method, url, headers=None, body=None):
@@ -60,8 +82,15 @@ def http(method, url, headers=None, body=None):
         return status, None, raw
 
 
-def api(method, path, token=None, body=None):
-    return http(method, BASE + path, {'Authorization': f'Bearer {token}'} if token else {}, body)
+def api(method, path, token=None, body=None, headers=None):
+    return http(method, BASE + path, {**({'Authorization': f'Bearer {token}'} if token else {}), **(headers or {})}, body)
+
+
+def public_reserve(body):
+    """Reserva pública com IP de teste conhecido (bucket A6 rastreado para a limpeza)."""
+    ip = f'198.{random.randint(18, 19)}.{random.randint(0, 255)}.{random.randint(1, 254)}'
+    FX.public_reserve(ARENA_A, body.get('phone'), ip)
+    return api('POST', '/public/reserve', None, body, {'X-Forwarded-For': ip})
 
 
 def uh(token):
@@ -70,6 +99,10 @@ def uh(token):
 
 def rest(method, table, token, body=None, query=''):
     return http(method, f'{SB}/rest/v1/{table}{query}', uh(token), body)
+
+
+def svc_rest(method, table, body=None, query=''):
+    return http(method, f'{SB}/rest/v1/{table}{query}', {**SVC, 'Prefer': 'return=representation'}, body)
 
 
 def svc_get(table, params):
@@ -82,6 +115,7 @@ def create_user(label):
     email = f'a2-{label}-{RUN}@{DOMAIN}'
     s, b, raw = http('POST', f'{SB}/auth/v1/admin/users', SVC, {'email': email, 'password': PASSWORD, 'email_confirm': True})
     assert s in (200, 201), f'criar usuário {s} {raw[:200]}'
+    FX.user(b['id'])
     s, t, raw = http('POST', f'{SB}/auth/v1/token?grant_type=password', {'apikey': PUB_KEY}, {'email': email, 'password': PASSWORD})
     assert s == 200, f'login {s} {raw[:200]}'
     return b['id'], t['access_token']
@@ -96,7 +130,7 @@ def onboard(token, label, courts):
         'default_reservation_minutes': 60,
     })
     assert s == 200, f'onboarding {label} {s} {raw[:200]}'
-    org = b['organization_id']
+    org = FX.org(b['organization_id'], f'A2 Org {label} {RUN}')
     _, arenas, _ = api('GET', f'/arenas?organization_id={org}', token)
     _, courts_l, _ = api('GET', f'/courts?organization_id={org}', token)
     return org, arenas[0]['id'], {c['name']: c['id'] for c in courts_l}
@@ -176,6 +210,20 @@ def rejected_tenant(s, b, raw, what, codes=('RGT01',)):
 
 def rejected_immutable(s, b, raw, what):
     rejected_tenant(s, b, raw, what, codes=('RGT02',))
+
+
+def direct_transitional(s, b, raw, what):
+    """Escrita direta nas 5 colunas transitórias: permitida pelo grant na FOUNDATION; 42501 no LOCKDOWN."""
+    if LOCKDOWN:
+        rejected_direct_write(s, b, raw, f'{what} (LOCKDOWN)')
+    else:
+        assert s == 200, f'{what} (FOUNDATION: grant transitório permite): {s} {raw[:160]}'
+
+
+def rejected_direct_write(s, b, raw, what):
+    """Sem privilégio de escrita direta (coluna fora do grant na FOUNDATION, ou tudo no LOCKDOWN)."""
+    assert s in (401, 403) and isinstance(b, dict) and b.get('code') == '42501', f'{what}: esperado 401/403 + 42501, veio {s} {raw[:160]}'
+    assert no_leak(raw), f'{what}: resposta vazou dado da outra organização'
 
 
 def api_friendly(s, b, raw, msg, what):
@@ -265,9 +313,9 @@ def r12():
     d = str(DAY + timedelta(days=5))
     body = {'slug': SLUG, 'court_id': COURT_A, 'date': d, 'start_time': '10:00', 'end_time': '11:00', 'name': 'Jogador A2',
             'phone': '11944440004', 'email': None, 'accept_terms': True, 'idempotency_key': f'a2-{RUN}'}
-    s, b, raw = api('POST', '/public/reserve', None, body)
+    s, b, raw = public_reserve(body)
     assert s == 201 and b.get('public_code'), f'pública válida: {s} {raw[:160]}'
-    s, b, raw = api('POST', '/public/reserve', None, {**body, 'court_id': COURT_B, 'start_time': '11:00', 'end_time': '12:00', 'idempotency_key': f'a2b-{RUN}'})
+    s, b, raw = public_reserve({**body, 'court_id': COURT_B, 'start_time': '11:00', 'end_time': '12:00', 'idempotency_key': f'a2b-{RUN}'})
     assert s == 404 and no_leak(raw), f'pública com quadra B deveria 404: {s} {raw[:160]}'
 
 
@@ -276,7 +324,7 @@ def r13_recurring():
     wd = (DAY.isoweekday() % 7)
     s, b, raw = api('POST', '/recurring-reservations', TA, {'organization_id': ORG_A, 'arena_id': ARENA_A, 'court_id': COURT_A1B, 'frequency': 'WEEKLY',
                                                             'weekday': wd, 'start_time': '22:00', 'end_time': '23:00', 'start_date': str(DAY), 'has_no_end_date': True,
-                                                            'customer_id': CUST_A})
+                                                            'customer_id': CUST_A, 'operation_id': str(uuid.uuid4())})
     assert s == 201 and b['created'] > 0, f'criar mensalista: {s} {raw[:160]}'
     occ = svc_get('reservations', {'recurring_reservation_id': f'eq.{b["id"]}', 'select': 'id', 'order': 'occurrence_date.asc'})
     s, bb, raw = rest('PATCH', 'reservations', TA, {'customer_id': CUST_B}, f'?id=eq.{occ[0]["id"]}')
@@ -461,7 +509,8 @@ def s_setup():
     d = DAY + timedelta(days=2)
     s, b, raw = api('POST', '/recurring-reservations', TA, {'organization_id': ORG_A, 'arena_id': ARENA_A, 'court_id': COURT_A, 'frequency': 'WEEKLY',
                                                             'weekday': d.isoweekday() % 7, 'start_time': '23:00', 'end_time': '00:00', 'start_date': str(d),
-                                                            'has_no_end_date': True, 'customer_id': CUST_A, 'skip_conflicts': True})
+                                                            'has_no_end_date': True, 'customer_id': CUST_A, 'skip_conflicts': True,
+                                                            'operation_id': str(uuid.uuid4())})
     assert s == 201 and b['created'] > 0, f'série S: {s} {raw[:160]}'
     S['id'] = b['id']
     S['start'] = str(d)
@@ -473,20 +522,27 @@ def s_intact():
 
 
 def s1():
-    rejected_immutable(*rest('PATCH', 'recurring_reservations', TA, {'organization_id': ORG_B, 'arena_id': ARENA_B, 'court_id': COURT_B, 'customer_id': CUST_B},
-                             f'?id=eq.{S["id"]}'), 'série -> conjunto coerente da org B')
+    coherent_b = {'organization_id': ORG_B, 'arena_id': ARENA_B, 'court_id': COURT_B, 'customer_id': CUST_B}
+    # authenticated (mesmo OWNER das duas orgs) não tem UPDATE nessas colunas em nenhum modo.
+    rejected_direct_write(*rest('PATCH', 'recurring_reservations', TA, coherent_b, f'?id=eq.{S["id"]}'), 'série -> org B (authenticated direto)')
+    # Imutabilidade no banco continua valendo para qualquer escritor restante (service_role).
+    rejected_immutable(*svc_rest('PATCH', 'recurring_reservations', coherent_b, f'?id=eq.{S["id"]}'), 'série -> conjunto coerente da org B (service_role)')
     s_intact()
 
 
 def s2():
-    rejected_immutable(*rest('PATCH', 'recurring_reservations', TA, {'court_id': COURT_A1B}, f'?id=eq.{S["id"]}'), 'série -> só court_id (mesma arena)')
-    rejected_immutable(*rest('PATCH', 'recurring_reservations', TA, {'customer_id': Q['cust_a3']}, f'?id=eq.{S["id"]}'), 'série -> só customer_id (mesma org)')
+    rejected_direct_write(*rest('PATCH', 'recurring_reservations', TA, {'court_id': COURT_A1B}, f'?id=eq.{S["id"]}'), 'série -> court_id (authenticated direto)')
+    rejected_immutable(*svc_rest('PATCH', 'recurring_reservations', {'court_id': COURT_A1B}, f'?id=eq.{S["id"]}'), 'série -> só court_id (service_role)')
+    rejected_immutable(*svc_rest('PATCH', 'recurring_reservations', {'customer_id': Q['cust_a3']}, f'?id=eq.{S["id"]}'), 'série -> só customer_id (service_role)')
+    # RPC de edição simples não aceita campo estrutural (lista fechada -> 22023).
+    s, b, raw = http('POST', f'{SB}/rest/v1/rpc/rg_recurring_update', uh(TA), {'p_series_id': S['id'], 'p_changes': {'court_id': COURT_A1B}})
+    assert s == 400 and isinstance(b, dict) and b.get('code') == '22023', f'RPC update com court_id: {s} {raw[:160]}'
     s_intact()
 
 
 def s3():
-    s, b, raw = rest('PATCH', 'recurring_reservations', TA, {'notes': 'nota A2', 'default_price': 12000}, f'?id=eq.{S["id"]}')
-    assert s == 200 and b and b[0]['notes'] == 'nota A2' and b[0]['default_price'] == 12000, f'PostgREST notes/price: {s} {raw[:160]}'
+    direct_transitional(*rest('PATCH', 'recurring_reservations', TA, {'notes': 'nota A2', 'default_price': 12000},
+                              f'?id=eq.{S["id"]}&select=id,notes,default_price'), 'notes/price direto')
     s, b, raw = api('PATCH', f'/recurring-reservations/{S["id"]}', TA, {'notes': 'nota via API', 'default_price': 13000, 'customer_id': Q['cust_a3']})
     assert s == 200 and b['notes'] == 'nota via API' and b['default_price'] == 13000, f'API PATCH: {s} {raw[:160]}'
     s_intact()  # customer_id enviado pela API é ignorado (fora da lista permitida)
@@ -501,11 +557,25 @@ def s4():
     occ = svc_get('reservations', {'recurring_reservation_id': f'eq.{S["id"]}', 'select': 'occurrence_date', 'order': 'occurrence_date.asc'})
     from_date = occ[1]['occurrence_date']
     s, b, raw = api('POST', f'/recurring-reservations/{S["id"]}/reschedule', TA, {'from_date': from_date, 'court_id': COURT_A1B, 'start_time': '21:00', 'end_time': '22:00',
-                                                                                'skip_conflicts': True})
+                                                                                'skip_conflicts': True, 'operation_id': str(uuid.uuid4())})
     assert s == 201, f'"Esta e as próximas": {s} {raw[:160]}'
-    new = svc_get('recurring_reservations', {'id': f'eq.{b["id"]}', 'select': 'organization_id,arena_id,court_id,customer_id'})[0]
-    assert new == {'organization_id': ORG_A, 'arena_id': ARENA_A, 'court_id': COURT_A1B, 'customer_id': CUST_A}, new
+    new = svc_get('recurring_reservations', {'id': f'eq.{b["id"]}', 'select': 'organization_id,arena_id,court_id,customer_id,previous_series_id,operation_kind'})[0]
+    assert new == {'organization_id': ORG_A, 'arena_id': ARENA_A, 'court_id': COURT_A1B, 'customer_id': CUST_A,
+                   'previous_series_id': S['id'], 'operation_kind': 'RESCHEDULE'}, new
     s_intact()  # série antiga mantém os vínculos; só status/end_date mudam
+
+
+def s5_b3_metadata():
+    """Metadados B3 (linhagem/idempotência) não podem ser forjados por authenticated, nem via
+    INSERT direto nem via UPDATE direto; status também não muda por escrita direta."""
+    forged = {'organization_id': ORG_A, 'arena_id': ARENA_A, 'court_id': COURT_A, 'frequency': 'WEEKLY', 'weekday': 1,
+              'start_time': '06:00', 'end_time': '07:00', 'start_date': str(DAY), 'has_no_end_date': True,
+              'operation_id': str(uuid.uuid4()), 'operation_kind': 'RESCHEDULE', 'previous_series_id': S['id']}
+    rejected_direct_write(*rest('POST', 'recurring_reservations', TA, forged), 'INSERT com metadados B3 forjados')
+    direct_transitional(*rest('PATCH', 'recurring_reservations', TA, {'status': 'PAUSED'}, f'?id=eq.{S["id"]}&select=id,status'), 'UPDATE status direto')
+    # operation_request nunca é legível por authenticated.
+    s, b, raw = rest('GET', 'recurring_reservations', TA, query=f'?id=eq.{S["id"]}&select=operation_request')
+    assert s in (401, 403) and isinstance(b, dict) and b.get('code') == '42501', f'SELECT operation_request: {s} {raw[:160]}'
 
 
 def p9_consistency():
@@ -562,14 +632,16 @@ for name, fn in [
     ('Q0 setup reserva/cliente', q_setup), ('Q1 FAIL reserva -> org B (membro das duas)', q1),
     ('Q2 FAIL reserva -> conjunto coerente da org B (RGT02)', q2), ('Q3 FAIL reserva -> outra arena da mesma org', q3),
     ('Q4 PASS reserva -> outra quadra da mesma arena', q4), ('Q5 PASS reserva -> outro cliente da mesma org', q5),
-    ('S0 setup série', s_setup), ('S1 FAIL série -> conjunto coerente da org B (RGT02)', s1),
-    ('S2 FAIL série -> só court_id / só customer_id', s2), ('S3 PASS notes/price/pausar/reativar', s3),
-    ('S4 PASS "Esta e as próximas"', s4),
+    ('S0 setup série', s_setup), ('S1 FAIL série -> org B (direto 42501; service_role RGT02)', s1),
+    ('S2 FAIL série -> court_id / customer_id (direto 42501; service_role RGT02; RPC 22023)', s2),
+    ('S3 PASS notes/price/pausar/reativar via API (direto: grant transitório | 42501 no lockdown)', s3),
+    ('S4 PASS "Esta e as próximas" (RPC, linhagem)', s4), ('S5 metadados B3 forjados 42501 / status direto conforme o modo', s5_b3_metadata),
     ('P9 consistência: zero inconsistências', p9_consistency),
     ('FINAL nenhum registro cruzado gravado', final_state),
 ]:
     check(name, fn)
 
 ok = sum(1 for v in results.values() if v == 'PASS')
-print(f'\n== {ok}/{len(results)} PASS (run {RUN}, org A {ORG_A}, org B {ORG_B}) ==')
-sys.exit(0 if ok == len(results) else 1)
+print(f'\n== {ok}/{len(results)} PASS (run {RUN}, modo {"LOCKDOWN" if LOCKDOWN else "FOUNDATION"}, org A {ORG_A}, org B {ORG_B}) ==')
+residual = FX.cleanup()
+sys.exit(0 if ok == len(results) and residual == 0 else 1)

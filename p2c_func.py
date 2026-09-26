@@ -2,15 +2,24 @@
 """
 Phase 2C Recurring Reservations Functional Test Suite
 Tests T1-T13 + EXTRA(a)(b) for recurring reservations functionality
+
+B3: create/reschedule enviam operation_id (UUID novo por chamada/intenção, via api_call).
+Não usa mais a conta real TEST_ACCOUNT_EMAIL: cria owners e organizações EFÊMEROS (is_demo)
+e faz limpeza verificável no fim (tests/harness_cleanup.py): created / cleaned / residual.
 """
+import atexit
 import os
 import sys
 import json
+import uuid
 import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv('/app/.env')
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tests'))
+from harness_cleanup import FixtureTracker  # noqa: E402
 
 # Configuration
 SUPABASE_URL = os.getenv('SUPABASE_URL')
@@ -18,6 +27,11 @@ SUPABASE_SECRET_KEY = os.getenv('SUPABASE_SECRET_KEY')
 SUPABASE_PUBLISHABLE_KEY = os.getenv('NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY')
 BASE_URL = os.getenv('NEXT_PUBLIC_BASE_URL')
 API_BASE = f"{BASE_URL}/api"
+RUN = uuid.uuid4().hex[:8]
+DOMAIN = os.getenv('TEST_EMAIL_DOMAIN', 'reservagol.test')
+# Limpeza verificável: só usuários/organizações criados NESTA execução.
+FX = FixtureTracker(SUPABASE_URL, SUPABASE_SECRET_KEY)
+atexit.register(FX.cleanup)
 
 # Test results tracking
 results = {}
@@ -40,6 +54,7 @@ def create_user_via_admin(email, password):
     }
     resp = requests.post(url, headers=headers, json=payload)
     if resp.status_code in [200, 201]:
+        FX.user(resp.json().get('id'))
         return resp.json()
     elif resp.status_code == 422 and 'already registered' in resp.text.lower():
         log(f"User {email} already exists, continuing...")
@@ -64,6 +79,10 @@ def get_token(email, password):
 def api_call(method, endpoint, token, data=None, expect_status=None):
     """Make API call with Bearer token"""
     url = f"{API_BASE}{endpoint}"
+    # B3: create/reschedule exigem operation_id (uma chave nova por chamada = nova intenção).
+    if method == 'POST' and isinstance(data, dict) and 'operation_id' not in data and (
+            endpoint == '/recurring-reservations' or endpoint.endswith('/reschedule')):
+        data = {**data, 'operation_id': str(uuid.uuid4())}
     headers = {
         'Authorization': f'Bearer {token}',
         'Content-Type': 'application/json'
@@ -87,7 +106,7 @@ def api_call(method, endpoint, token, data=None, expect_status=None):
 def setup_org(token, org_name, arena_name):
     """Create organization via onboarding"""
     payload = {
-        'organization': {'name': org_name, 'owner_name': 'Test Owner', 'phone': '11999999999'},
+        'organization': {'name': org_name, 'owner_name': 'Test Owner', 'phone': '11999999999', 'is_demo': True},
         'arena': {
             'name': arena_name,
             'address': 'Rua Teste',
@@ -158,52 +177,30 @@ def find_next_weekday(target_weekday, start_date=None):
 def main():
     log("=== Phase 2C Recurring Reservations Test Suite ===")
     
-    # Setup: Create users and organizations
-    log("\n--- SETUP: Using pre-existing test users (DNS issue workaround) ---")
-    log("NOTE: Supabase DNS resolution failing, attempting to use existing test infrastructure")
-    
+    # Setup: owners e organizações EFÊMEROS (nunca a conta real), rastreados para a limpeza.
+    log("\n--- SETUP: owners/organizações efêmeros (run " + RUN + ") ---")
     try:
-        # Try using existing test users from test_result.md
-        email_a = os.environ['TEST_ACCOUNT_EMAIL']
         password = os.environ['TEST_ACCOUNT_PASSWORD']  # sem fallback: definir no ambiente
-        
-        log(f"Attempting to use existing user: {email_a}")
-        try:
-            token_a = get_token(email_a, password)
-            log("✓ Owner A authenticated with existing account")
-        except Exception as e:
-            log(f"❌ Cannot authenticate with existing user: {e}")
-            log("❌ CRITICAL: DNS resolution for Supabase is failing")
-            log("   This is an infrastructure issue preventing test execution")
-            log("   The test script is correct but cannot connect to Supabase")
-            raise Exception("Infrastructure failure: Cannot resolve Supabase DNS")
-        
-        # Get context
+        email_a = f"p2c-func-a-{RUN}@{DOMAIN}"
+        create_user_via_admin(email_a, password)
+        token_a = get_token(email_a, password)
+        org_a_name = f"P2C Func A {RUN}"
+        setup_org(token_a, org_a_name, f"Arena P2C Func A {RUN}")
         ctx_a = get_context(token_a)
-        log(f"✓ Using existing Org: {ctx_a['org_id']}")
-        log(f"  Arena: {ctx_a['arena_id']}")
-        log(f"  Courts: {[c['name'] for c in ctx_a['courts']]}")
-        
+        FX.org(ctx_a['org_id'], org_a_name)
+        log(f"✓ Org A: {ctx_a['org_id']}  Courts: {[c['name'] for c in ctx_a['courts']]}")
         if len(ctx_a['courts']) < 2:
             raise Exception("Need at least 2 courts for testing")
-        
         court_a1 = ctx_a['courts'][0]
         court_a2 = ctx_a['courts'][1]
-        
-        # For Owner B, we'll create a new user if possible, or skip cross-org tests
-        try:
-            email_b = f"p2c_owner_b_{datetime.now().timestamp()}@test.com"
-            log(f"\nAttempting to create Owner B: {email_b}")
-            create_user_via_admin(email_b, password)
-            token_b = get_token(email_b, password)
-            setup_org(token_b, "Org B P2C", "Arena B")
-            ctx_b = get_context(token_b)
-            log(f"✓ Org B created: {ctx_b['org_id']}")
-        except Exception as e:
-            log(f"⚠️  Could not create Org B (DNS issue): {e}")
-            log("   Will skip cross-org tests (T8 cross-arena check)")
-            ctx_b = None
-        
+        email_b = f"p2c-func-b-{RUN}@{DOMAIN}"
+        create_user_via_admin(email_b, password)
+        token_b = get_token(email_b, password)
+        org_b_name = f"P2C Func B {RUN}"
+        setup_org(token_b, org_b_name, f"Arena P2C Func B {RUN}")
+        ctx_b = get_context(token_b)
+        FX.org(ctx_b['org_id'], org_b_name)
+        log(f"✓ Org B: {ctx_b['org_id']}")
     except Exception as e:
         log(f"❌ SETUP FAILED: {e}")
         sys.exit(1)
@@ -1087,7 +1084,8 @@ def main():
 if __name__ == '__main__':
     try:
         success = main()
-        sys.exit(0 if success else 1)
+        residual = FX.cleanup()
+        sys.exit(0 if success and residual == 0 else 1)
     except Exception as e:
         log(f"\n❌ FATAL ERROR: {e}")
         import traceback
