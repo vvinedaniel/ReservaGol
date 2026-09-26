@@ -358,13 +358,23 @@ def t11_lockdown():
 
 
 # ----------------------------------------------------------------------------- concorrência (R rodadas cada)
+def iso_court(tag):
+    """Quadra exclusiva de UMA rodada de UM caso de concorrência, na org efêmera do run (o cleanup
+    por organization_id a remove). Isolamento estrutural: nenhuma fixture de outro caso ou de outra
+    rodada ocupa esta quadra, então os horários podem ser fixos e B3_ROUNDS continua livre."""
+    s, b, raw = svc('POST', 'courts', {'organization_id': ORG, 'arena_id': ARENA, 'name': f'{tag} {RUN}'})
+    assert s == 201, f'quadra {tag} {s} {raw[:200]}'
+    C[tag] = b[0]['id']
+    return tag
+
+
 def gen_call(sid, dates, token=None):
     return lambda: rpc('rg_recurring_generate', {'p_series_id': sid, 'p_dates': [str(d) for d in dates]}, token or T_OWNER)
 
 
 def c01_generate_x_generate():
     for r in range(ROUNDS):
-        sid = create_rpc_series('c6', f'{6 + r:02d}:00', f'{7 + r:02d}:00', [D1])
+        sid = create_rpc_series(iso_court(f'c01-r{r}'), '06:00', '07:00', [D1])
         a, b = parallel(gen_call(sid, [D2, D3]), gen_call(sid, [D2, D3], T_REC))
         assert a[0] == 200 and b[0] == 200, f'{a[:2]} {b[:2]}'
         rows = occ(sid)
@@ -374,7 +384,7 @@ def c01_generate_x_generate():
 
 def c02_generate_x_pause():
     for r in range(ROUNDS):
-        sid = create_rpc_series('c6', f'{10 + r:02d}:00', f'{11 + r:02d}:00', [D1])
+        sid = create_rpc_series(iso_court(f'c02-r{r}'), '10:00', '11:00', [D1])
         g, p = parallel(gen_call(sid, [D2, D3]), lambda: rpc('rg_recurring_pause', {'p_series_id': sid, 'p_cancel_future': True}, T_OWNER))
         assert p[0] == 200 and g[0] in (200, 400), f'gen {g[:2]} pause {p[:2]}'
         if g[0] == 400:
@@ -385,7 +395,7 @@ def c02_generate_x_pause():
 
 def c03_generate_x_cancel():
     for r in range(ROUNDS):
-        sid = create_rpc_series('c6', f'{14 + r:02d}:00', f'{15 + r:02d}:00', [D1])
+        sid = create_rpc_series(iso_court(f'c03-r{r}'), '14:00', '15:00', [D1])
         g, c = parallel(gen_call(sid, [D2, D3]), lambda: rpc('rg_recurring_cancel', {'p_series_id': sid}, T_OWNER))
         assert c[0] == 200 and g[0] in (200, 400), f'gen {g[:2]} cancel {c[:2]}'
         assert series_row(sid)['status'] == 'CANCELLED'
@@ -394,7 +404,7 @@ def c03_generate_x_cancel():
 
 def c04_reactivate_x_cancel():
     for r in range(ROUNDS):
-        sid = create_rpc_series('c5', f'{10 + r:02d}:00', f'{11 + r:02d}:00', [D1])
+        sid = create_rpc_series(iso_court(f'c04-r{r}'), '10:00', '11:00', [D1])
         s, _, raw = rpc('rg_recurring_pause', {'p_series_id': sid, 'p_cancel_future': False}, T_OWNER)
         assert s == 200, raw[:160]
         a, c = parallel(lambda: rpc('rg_recurring_reactivate', {'p_series_id': sid, 'p_dates': [str(D2)]}, T_OWNER),
@@ -406,7 +416,7 @@ def c04_reactivate_x_cancel():
 
 def c05_reschedule_x_reschedule_same_series():
     for r in range(ROUNDS):
-        sid = create_rpc_series('c1', f'{14 + r:02d}:00', f'{15 + r:02d}:00', [D1, D2])
+        sid = create_rpc_series(iso_court(f'c05-r{r}'), '14:00', '15:00', [D1, D2])
         mk = lambda st: lambda: api('POST', f'/recurring-reservations/{sid}/reschedule', T_OWNER,  # noqa: E731
                                     {'from_date': str(D2), 'start_time': st, 'end_time': f'{int(st[:2]) + 1:02d}:00', 'skip_conflicts': True, 'operation_id': str(uuid.uuid4())})
         a, b = parallel(mk('18:00'), mk('20:00'))
@@ -419,10 +429,10 @@ def c05_reschedule_x_reschedule_same_series():
 
 def c06_reschedule_a_x_b_same_op():
     for r in range(ROUNDS):
-        sa = create_rpc_series('c2', f'{6 + r:02d}:00', f'{7 + r:02d}:00', [D1, D2])
-        sb = create_rpc_series('c3', f'{6 + r:02d}:00', f'{7 + r:02d}:00', [D1, D2])
+        sa = create_rpc_series(iso_court(f'c06a-r{r}'), '06:00', '07:00', [D1, D2])
+        sb = create_rpc_series(iso_court(f'c06b-r{r}'), '06:00', '07:00', [D1, D2])
         op = str(uuid.uuid4())
-        body = {'from_date': str(D2), 'start_time': f'{12 + r:02d}:00', 'end_time': f'{13 + r:02d}:00', 'skip_conflicts': True, 'operation_id': op}
+        body = {'from_date': str(D2), 'start_time': '12:00', 'end_time': '13:00', 'skip_conflicts': True, 'operation_id': op}
         a, b = parallel(lambda: api('POST', f'/recurring-reservations/{sa}/reschedule', T_OWNER, body),
                         lambda: api('POST', f'/recurring-reservations/{sb}/reschedule', T_OWNER, body))
         assert sorted([a[0], b[0]]) == [201, 409], f'{a[:2]} {b[:2]}'
@@ -436,7 +446,7 @@ def c06_reschedule_a_x_b_same_op():
 def c07_create_x_create_same_op():
     for r in range(ROUNDS):
         op = str(uuid.uuid4())
-        body = series_body('c4', f'{14 + r:02d}:00', f'{15 + r:02d}:00', operation_id=op, skip_conflicts=True)
+        body = series_body(iso_court(f'c07-r{r}'), '14:00', '15:00', operation_id=op, skip_conflicts=True)
         a, b = parallel(lambda: api('POST', '/recurring-reservations', T_OWNER, body), lambda: api('POST', '/recurring-reservations', T_OWNER, body))
         assert sorted([a[0], b[0]]) == [200, 201], f'{a[:2]} {b[:2]}'
         loser = a if a[0] == 200 else b
@@ -450,8 +460,8 @@ def c07_create_x_create_same_op():
 def c08_create_same_op_diff_payload():
     for r in range(ROUNDS):
         op = str(uuid.uuid4())
-        b1 = series_body('c5', f'{18 + r:02d}:00', f'{19 + r:02d}:00', operation_id=op, skip_conflicts=True)
-        b2 = {**b1, 'court_id': C['c6']}
+        b1 = series_body(iso_court(f'c08a-r{r}'), '18:00', '19:00', operation_id=op, skip_conflicts=True)
+        b2 = {**b1, 'court_id': C[iso_court(f'c08b-r{r}')]}
         a, b = parallel(lambda: api('POST', '/recurring-reservations', T_OWNER, b1), lambda: api('POST', '/recurring-reservations', T_OWNER, b2))
         assert sorted([a[0], b[0]]) == [201, 409], f'{a[:2]} {b[:2]}'
         assert len(svc_get('recurring_reservations', {'operation_id': f'eq.{op}', 'select': 'id'})) == 1
@@ -463,7 +473,7 @@ def c10_double_click_create_no_skip():
     needs_decision falso causado pela própria série, nunca série duplicada."""
     for r in range(ROUNDS):
         op = str(uuid.uuid4())
-        body = series_body('c3', f'{6 + r:02d}:00', f'{7 + r:02d}:00', operation_id=op)
+        body = series_body(iso_court(f'c10-r{r}'), '06:00', '07:00', operation_id=op)
         a, b = parallel(lambda: api('POST', '/recurring-reservations', T_OWNER, body), lambda: api('POST', '/recurring-reservations', T_OWNER, body))
         assert sorted([a[0], b[0]]) == [200, 201], f'{a[:2]} {b[:2]}'
         loser = a if a[0] == 200 else b
@@ -476,8 +486,8 @@ def c10_double_click_create_no_skip():
 
 def c09_reschedule_retry_after_timeout():
     for r in range(ROUNDS):
-        sid = create_rpc_series('c2', f'{18 + r:02d}:00', f'{19 + r:02d}:00', [D1, D2])
-        body = {'from_date': str(D2), 'start_time': f'{20 + r % 3:02d}:00', 'end_time': f'{21 + r % 3:02d}:00', 'skip_conflicts': True, 'operation_id': str(uuid.uuid4())}
+        sid = create_rpc_series(iso_court(f'c09-r{r}'), '18:00', '19:00', [D1, D2])
+        body = {'from_date': str(D2), 'start_time': '20:00', 'end_time': '21:00', 'skip_conflicts': True, 'operation_id': str(uuid.uuid4())}
         a, b = parallel(lambda: api('POST', f'/recurring-reservations/{sid}/reschedule', T_OWNER, body),
                         lambda: api('POST', f'/recurring-reservations/{sid}/reschedule', T_OWNER, body))
         assert sorted([a[0], b[0]]) == [200, 201], f'retry concorrente do mesmo op: {a[:2]} {b[:2]}'
