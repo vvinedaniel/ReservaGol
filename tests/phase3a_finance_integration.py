@@ -43,6 +43,9 @@ if os.environ.get('P3A_ALLOW_WRITE') != '1':
 if os.environ.get('P3A_EXPECT_GUARDS') not in ('0', '1'):
     print('Defina P3A_EXPECT_GUARDS=0 (FOUNDATION) ou P3A_EXPECT_GUARDS=1 (GUARDS aplicados).')
     sys.exit(2)
+if os.environ.get('P3A_EXPECT_FIX', '0') not in ('0', '1'):
+    print('P3A_EXPECT_FIX deve ser 0 (FIX1/FIX2 não aplicados) ou 1 (aplicados).')
+    sys.exit(2)
 
 BASE = os.environ['BASE_URL'].rstrip('/') + '/api'
 SB = os.environ['SUPABASE_URL'].rstrip('/')
@@ -52,6 +55,7 @@ PASSWORD = os.environ['TEST_ACCOUNT_PASSWORD']
 DOMAIN = os.environ.get('TEST_EMAIL_DOMAIN', 'reservagol.test')
 ROUNDS = int(os.environ.get('P3A_ROUNDS', '3'))
 GUARDS = os.environ['P3A_EXPECT_GUARDS'] == '1'
+FIX = os.environ.get('P3A_EXPECT_FIX', '0') == '1'   # FIX1 + FIX2 aplicados no banco
 SP = timezone(timedelta(hours=-3))
 RUN = uuid.uuid4().hex[:8]
 ORG_PREFIX = f'P3A IT {RUN}'
@@ -104,7 +108,10 @@ def user_rest(method, table, token, body=None, query=''):
 
 def check(name, fn):
     try:
-        fn()
+        if fn() == 'SKIP':
+            results[name] = 'SKIP'
+            print(f'SKIP  {name}')
+            return
         results[name] = 'PASS'
         print(f'PASS  {name}')
     except AssertionError as e:
@@ -383,6 +390,72 @@ def t07b_notes_validation():
     assert by_id[rb['payment_id']]['notes'] == 'z' * 500 and by_id[rb2['payment_id']]['notes'] is None, 'REFUND: notes gravada diferente'
 
 
+def t12_fix1_void_visibility():
+    """FIX1: motivo/autor da anulação só para OWNER/MANAGER; RECEPTIONIST vê voided_at; outro tenant 404."""
+    if not FIX:
+        return 'SKIP'
+    res = svc_reservation(new_court(ORG, ARENA, 't12'), D1, '10:00', '11:00', price=10000)
+    s, b, raw = pay(T_REC, res, 1000)
+    assert s == 201, raw[:160]
+    pid = b['payment_id']
+    s, _, raw = api('POST', f'/payments/{pid}/void', T_MGR, {'reason': f'motivo interno P3A {RUN}'})
+    assert s == 200, f'void {s} {raw[:160]}'
+
+    def entry(f):
+        return next(e for e in f['entries'] if e['id'] == pid)
+
+    for tok, who in [(T_OWNER, 'OWNER'), (T_MGR, 'MANAGER')]:
+        e = entry(fin(tok, res))
+        assert e.get('void_reason') == f'motivo interno P3A {RUN}' and e.get('voided_by') == U_MGR, f'{who} sem motivo/autor: {e}'
+    e = entry(fin(T_REC, res))
+    assert e.get('voided_at') and 'void_reason' not in e and 'voided_by' not in e, f'RECEPTIONIST recebeu dados internos: {e}'
+    s, _, raw = api('GET', f'/reservations/{res}/financials', T_OUT)
+    assert s == 404, f'outro tenant {s} {raw[:160]}'
+
+
+def t13_fix2_reprice_api():
+    """FIX2 pela API. Sem o FIX2 no banco: compatibilidade da route (nada recalculado, flags falsas)."""
+    court, d = new_court(ORG, ARENA, 't13'), D1 + timedelta(days=21)
+
+    def create(st, et):
+        s, r, raw = api('POST', '/reservations', T_REC, {'organization_id': ORG, 'arena_id': ARENA, 'court_id': court, 'date': str(d),
+                                                         'start_time': st, 'end_time': et, 'customer': {'name': f'Cliente P3A {RUN} fix2'}})
+        assert s == 201, f'criar {s} {raw[:200]}'
+        return r
+
+    def move(res, st, et):
+        s, u, raw = api('PUT', f'/reservations/{res}', T_REC, {'court_id': court, 'date': str(d), 'start_time': st, 'end_time': et})
+        assert s == 200, f'mover {s} {raw[:200]}'
+        return u
+
+    r = create('10:00', '11:00')
+    rid = r['id']
+    assert r['price'] == 10000, r
+    u = move(rid, '19:00', '20:00')
+    if not FIX:
+        assert u['price'] == 10000 and u['price_recalculated'] is False and u['price_review_required'] is False, f'route sem FIX2: {u}'
+        s, _, raw = api('PUT', f'/reservations/{rid}', T_REC, {'price_source': 'MANUAL'})
+        assert s == 400, f'price_source pelo cliente {s} {raw[:160]}'
+        return None
+    assert r['price_source'] == 'RULE', r
+    assert u['price'] == 17000 and u['price_source'] == 'RULE' and u['price_recalculated'] is True and u['price_review_required'] is False, f'recálculo: {u}'
+    s, _, raw = pay(T_REC, rid, 1000)
+    assert s == 201, raw[:160]
+    u = move(rid, '10:00', '11:00')
+    assert u['price'] == 17000 and u['price_source'] == 'RULE' and u['price_review_required'] is True and u['price_recalculated'] is False, f'com pagamento: {u}'
+    s, _, raw = api('PUT', f'/reservations/{rid}', T_REC, {'price_source': 'MANUAL'})
+    assert s == 400, f'price_source pela route {s} {raw[:160]}'
+    s, b, raw = user_rest('PATCH', 'reservations', T_OWNER, {'price_source': 'MANUAL'}, f'?id=eq.{rid}')
+    assert s in (401, 403) and b.get('code') == '42501', f'PATCH price_source direto {s} {raw[:160]}'
+    s, b, raw = http('PATCH', f'{SB}/rest/v1/reservations?id=eq.{rid}', {**SVC, 'Prefer': 'return=representation'}, {'price_source': 'MANUAL'})
+    assert s in (401, 403) and b.get('code') == '42501', f'PATCH price_source service_role {s} {raw[:160]}'
+    row = svc_get('reservations', {'id': f'eq.{rid}', 'select': 'price,price_source'})[0]
+    assert row == {'price': 17000, 'price_source': 'RULE'}, row
+    audits = svc_get('audit_logs', {'entity_id': f'eq.{rid}', 'action': 'eq.RESERVATION_PRICE_REPRICED', 'select': 'metadata'})
+    assert len(audits) == 1 and audits[0]['metadata']['old_price'] == 10000 and audits[0]['metadata']['new_price'] == 17000, audits
+    return None
+
+
 def t08_refund_void_permissions():
     s, _, raw = refund(T_REC, S['p2'], 1000)
     assert s == 403, f'recepção estorna {s} {raw[:160]}'
@@ -561,7 +634,7 @@ def g02_recurring_d7_and_set_price():
 # ----------------------------------------------------------------------------- main
 exit_code = 1
 try:
-    print(f'== Fase 03A — financeiro — integração/concorrência — run {RUN} (rounds={ROUNDS}, guards={GUARDS}) ==')
+    print(f'== Fase 03A — financeiro — integração/concorrência — run {RUN} (rounds={ROUNDS}, guards={GUARDS}, fix={FIX}) ==')
     U_OWNER, T_OWNER = create_user('owner')
     U_MGR, T_MGR = create_user('mgr')
     U_REC, T_REC = create_user('rec')
@@ -580,6 +653,9 @@ try:
         ('T06 pagamentos: parcial, pago, sobrepagamento', t06_payments_flow),
         ('T07 idempotência (replay, RGP02 por campo, replay após cancelamento)', t07_idempotency_api),
         ('T07b notes: 500 aceita, 501/tipo inválido = 400, espaços = NULL, sem truncar (PAYMENT e REFUND)', t07b_notes_validation),
+        ('T12 FIX1: motivo/autor da anulação só OWNER/MANAGER; recepção vê voided_at; outro tenant 404', t12_fix1_void_visibility),
+        ('T13 ' + ('FIX2: recálculo ao mover, lançamento ativo preserva + aviso, price_source protegido' if FIX
+                   else 'route compatível com o banco sem FIX2 (nada recalculado, flags falsas)'), t13_fix2_reprice_api),
         ('T08 estorno/anulação e permissões', t08_refund_void_permissions),
         ('T09 set_price (MANUAL/RULE) e resumos por papel', t09_set_price_and_summaries),
         ('T10 ledger: RLS e fingerprint', t10_ledger_rls),
@@ -597,8 +673,9 @@ try:
     for name, fn in cases:
         check(name, fn)
     ok = sum(1 for v in results.values() if v == 'PASS')
-    print(f'\n== {ok}/{len(results)} PASS (run {RUN}) ==')
-    exit_code = 0 if ok == len(results) else 1
+    skipped = sum(1 for v in results.values() if v == 'SKIP')
+    print(f'\n== {ok}/{len(results) - skipped} PASS, {skipped} SKIP (run {RUN}, fix={FIX}) ==')
+    exit_code = 0 if ok + skipped == len(results) else 1
 finally:
     if FX.cleanup() != 0:
         exit_code = 1

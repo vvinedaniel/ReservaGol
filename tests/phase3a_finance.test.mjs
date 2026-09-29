@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { parseMoneyToCents, formatCents, centsToInput, toCents, MAX_CENTS } from '../lib/reserva/money.js'
 import { previewRulePeriods, localInputToISO, nowLocalInput, PAYMENT_METHODS, PRICE_REASONS, normalizeFinanceNotes, NOTES_MAX_CHARS } from '../lib/reserva/finance.js'
@@ -258,7 +259,9 @@ await check('P3A-24 UI de preços: EXATAMENTE UM POST por criação (todos os di
   assert.ok(!/expandRuleDrafts/.test(ui + read('lib/reserva/finance.js')), 'helper antigo de split ainda existe')
 })
 await check('P3A-25 SQL sem SQL dinâmico e sem tipo float/numeric para dinheiro', () => {
-  for (const [name, sql] of [['foundation', FOUNDATION], ['guards', GUARDS]]) {
+  const fixes = ['migration_phase3a_fix1_void_reason_visibility', 'migration_phase3a_fix2_price_origin', 'rollback_phase3a_fix1_void_reason_visibility', 'rollback_phase3a_fix2_price_origin']
+    .map((f) => [f, stripSqlComments(read(`supabase/${f}.sql`))])
+  for (const [name, sql] of [['foundation', FOUNDATION], ['guards', GUARDS], ...fixes]) {
     assert.ok(!/\bexecute\s+(format|'|\w+\s*\|\|)/i.test(sql), `${name}: SQL dinâmico`)
     assert.ok(!/\b(float4|float8|double precision|real|money)\b/i.test(sql) && !/::numeric\b/.test(sql), `${name}: float`)
   }
@@ -383,6 +386,97 @@ await check('P3A-33 regras de preço: desativar pede confirmação e trata falha
   assert.ok(ui.includes('Desativar esta regra de preço?') && ui.includes('Ela não poderá ser reativada'), 'texto de confirmação')
   const fn = ui.slice(ui.indexOf('async function deactivate(rule)'), ui.indexOf('const byDay'))
   assert.ok(/try \{[\s\S]*await jsonReq[\s\S]*\} catch \{\s*toast\.error\(/.test(fn) && fn.includes('} finally { setDeactivating(false) }'), 'falha de rede sem toast')
+})
+
+// ------------------------------------------------------------------ FIX1 / FIX2 (revisão final do PR #12)
+const lfRead = (p) => read(p).replace(/\r\n/g, '\n')
+const sha256 = (s) => createHash('sha256').update(s, 'utf8').digest('hex')
+const FIX1 = stripSqlComments(lfRead('supabase/migration_phase3a_fix1_void_reason_visibility.sql'))
+const FIX2 = stripSqlComments(lfRead('supabase/migration_phase3a_fix2_price_origin.sql'))
+const origBlock = (name) => { const s = FOUNDATION_RAW.replace(/\r\n/g, '\n'); const i = s.indexOf(`create or replace function ${name}(`); return s.slice(i, s.indexOf('end $$;', i) + 'end $$;'.length) }
+await check('P3A-34 FIX1: motivo/autor da anulação só para OWNER/MANAGER, no banco; rollback restaura a FOUNDATION', () => {
+  assert.equal((FIX1.match(/create or replace function/g) || []).length, 1, 'FIX1 deve redefinir só o detalhe')
+  assert.ok(/create or replace function public\.rg_reservation_financial_detail\(p_reservation_id uuid\)\s*returns jsonb language plpgsql security definer set search_path = ''/.test(FIX1))
+  assert.ok(FIX1.includes('v_manager := private.is_org_manager(v_org, v_uid);'), 'sem checagem de gerente')
+  assert.ok(FIX1.includes("if v_org is null or not private.is_org_member(v_org, v_uid) then"), 'tenant isolation')
+  const base = FIX1.slice(FIX1.indexOf('jsonb_build_object(\n             \'id\''), FIX1.indexOf('|| case when v_manager'))
+  assert.ok(base.includes("'voided_at', p.voided_at") && !/void_reason|voided_by/.test(base), 'objeto base expõe dados internos')
+  assert.ok(FIX1.includes("|| case when v_manager then jsonb_build_object('voided_by', p.voided_by, 'void_reason', p.void_reason)\n                   else '{}'::jsonb end"))
+  assert.ok(FIX1.includes('alter function public.rg_reservation_financial_detail(uuid) owner to postgres;'))
+  assert.ok(FIX1.includes('revoke all on function public.rg_reservation_financial_detail(uuid) from public, anon, service_role;'))
+  assert.ok(FIX1.includes('grant execute on function public.rg_reservation_financial_detail(uuid) to authenticated;'))
+  assert.ok(/^\s*begin;[\s\S]*commit;\s*$/.test(FIX1), 'sem transação')
+  const rb = lfRead('supabase/rollback_phase3a_fix1_void_reason_visibility.sql')
+  assert.ok(rb.includes(origBlock('public.rg_reservation_financial_detail')), 'rollback não restaura o corpo original')
+})
+await check('P3A-35 FIX2: price_source definido só pelo banco; recálculo com guards antes; FOUNDATION/GUARDS intactas', () => {
+  assert.ok(FIX2.includes('alter table public.reservations add column if not exists price_source text;'))
+  assert.ok(FIX2.includes("check (price_source is null or (price_source in ('RULE', 'MANUAL', 'SERIES') and price is not null))"))
+  assert.ok(!/update public\.reservations\s+set[^;]*price_source[^;]*;/i.test(FIX2.slice(0, FIX2.indexOf('create or replace function'))), 'backfill em linhas existentes')
+  const snap = FIX2.slice(FIX2.indexOf('create or replace function private.enforce_reservation_price_snapshot'))
+  for (const s of ["new.price_source := case when new.price is null then null else 'SERIES' end;", "new.price_source := case when new.price is null then null else 'MANUAL' end;",
+    "new.price_source := case when v_price is null then null else 'RULE' end;"]) assert.ok(snap.slice(0, snap.indexOf('end $$;')).includes(s), `snapshot sem: ${s}`)
+  assert.ok(/function private\.enforce_reservation_price_snapshot\(\)\s*returns trigger language plpgsql security definer set search_path = ''/.test(FIX2))
+  const sp = FIX2.slice(FIX2.indexOf('create or replace function public.rg_reservation_set_price'))
+  const spb = sp.slice(0, sp.indexOf('end $$;'))
+  assert.ok(spb.includes("v_src := case when v_new is null then null when p_mode = 'RULE' then 'RULE' else 'MANUAL' end;"))
+  assert.ok(spb.includes('update public.reservations r set price = v_new, price_source = v_src where r.id = v_res.id;'))
+  assert.ok(spb.includes("'old_source', v_res.price_source, 'new_source', v_src") && spb.includes('private.rg_fin_lock_reservation(p_reservation_id, true)'))
+  const og = FIX2.slice(FIX2.indexOf('create or replace function private.enforce_reservation_price_origin_guard'))
+  assert.ok(/returns trigger language plpgsql set search_path = ''/.test(og.slice(0, 200)) && !/security definer/.test(og.slice(0, og.indexOf('end $$;'))), 'guard da origem deve ser INVOKER')
+  assert.ok(og.includes("if new.price_source is distinct from old.price_source and current_user <> 'postgres' then") && og.includes("errcode = '42501'"))
+  const rp = FIX2.slice(FIX2.indexOf('create or replace function private.enforce_reservation_price_reprice'))
+  const rpb = rp.slice(0, rp.indexOf('end $$;'))
+  assert.ok(/returns trigger language plpgsql security definer set search_path = ''/.test(rp.slice(0, 200)), 'recálculo deve ser DEFINER')
+  const order = ['if new.recurring_reservation_id is not null then', "if new.status not in ('PENDING', 'CONFIRMED', 'NO_SHOW') then",
+    'if new.price is distinct from old.price or new.price_source is distinct from old.price_source then',
+    "if not (old.price_source is not distinct from 'RULE' or (old.price is null and old.price_source is null)) then",
+    'p.reservation_id = old.id and p.voided_at is null', 'private.rg_price_quote(new.court_id, new.start_at, new.end_at)',
+    "'RESERVATION_PRICE_REPRICED'", "private.rg_fault('reprice:after_audit')"]
+  let last = -1
+  for (const s of order) { const i = rpb.indexOf(s); assert.ok(i > last, `recálculo fora de ordem/ausente: ${s}`); last = i }
+  assert.ok(!/'notes'|customer|phone|email/.test(rpb.slice(rpb.indexOf("'RESERVATION_PRICE_REPRICED'"))), 'audit com PII')
+  const names = ['enforce_reservation_tenant', 'enforce_reservation_zz_price_guard', 'enforce_reservation_zz_price_origin_guard', 'enforce_reservation_zz_price_reprice', 'protect_occurrence_anchor']
+  assert.deepEqual([...names].sort(), names, 'ordem alfabética dos BEFORE UPDATE')
+  assert.ok(FIX2.includes('create trigger enforce_reservation_zz_price_origin_guard before update on public.reservations') && FIX2.includes('create trigger enforce_reservation_zz_price_reprice before update on public.reservations'))
+  for (const fn of ['enforce_reservation_price_snapshot()', 'enforce_reservation_price_origin_guard()', 'enforce_reservation_price_reprice()']) {
+    assert.ok(FIX2.includes(`alter function private.${fn} owner to postgres;`) && FIX2.includes(`revoke all on function private.${fn} from public, anon, authenticated, service_role;`), fn)
+    assert.ok(!FIX2.includes(`grant execute on function private.${fn}`), `${fn}: grant indevido`)
+  }
+  assert.ok(!/enforce_reservation_price_guard\(\)/.test(FIX2.replace(/-- .*$/gm, '')), 'FIX2 não pode tocar o guard dos GUARDS')
+  const rb = lfRead('supabase/rollback_phase3a_fix2_price_origin.sql')
+  for (const n of ['private.enforce_reservation_price_snapshot', 'public.rg_reservation_set_price']) assert.ok(rb.includes(origBlock(n)), `rollback não restaura ${n}`)
+  for (const s of ['drop trigger if exists enforce_reservation_zz_price_reprice on public.reservations;', 'drop trigger if exists enforce_reservation_zz_price_origin_guard on public.reservations;',
+    'alter table public.reservations drop column if exists price_source;']) assert.ok(rb.includes(s), s)
+  // FOUNDATION e GUARDS aplicadas: byte a byte iguais aos hashes aprovados
+  assert.equal(sha256(FOUNDATION_RAW.replace(/\r\n/g, '\n')), '638c61a9b72b6db7e410258b13e4940f4c7030a97555171ce4015321a2f20696', 'FOUNDATION alterada')
+  assert.equal(sha256(lfRead('supabase/migration_phase3a_guards.sql')), '4f4baa84c2c21792165f77abde9e0193e34f767eddf3d59167a6ab0027ddace4', 'GUARDS alterada')
+})
+await check('P3A-36 route/UI FIX2: cliente nunca envia price_source; aviso de revisão só com lançamento ativo', () => {
+  assert.ok(/if \(body\.price_source !== undefined\) return json\(\{ error: 'A origem do valor é definida pelo sistema\.' \}, 400\)/.test(ROUTE), 'PUT/POST aceitam price_source')
+  assert.equal((ROUTE.match(/body\.price_source !== undefined/g) || []).length, 2, 'PUT e POST')
+  assert.ok(!/price_source\s*:/.test(ROUTE), 'route grava price_source')
+  const put = ROUTE.slice(ROUTE.indexOf("if (id && method === 'PUT') {"), ROUTE.indexOf("if (method === 'POST') {", ROUTE.indexOf("if (id && method === 'PUT') {")))
+  assert.ok(put.includes(".from('reservations').select('*').eq('id', id).maybeSingle()"), 'estado anterior incompleto')
+  assert.ok(put.includes("supabase.rpc('rg_reservation_financial_detail', { p_reservation_id: id })") && put.includes('fin.entries.some((e) => !e.voided_at)'), 'lançamento ativo não verificado')
+  assert.ok(put.includes("(before.price_source === 'RULE' || (before.price == null && before.price_source == null))") && put.includes('!data.recurring_reservation_id'))
+  assert.ok(put.includes('return json({ ...data, price_recalculated, price_review_required })'))
+  const dbStatuses = FIX2.match(/if new\.status not in \(([^)]*)\) then/)[1].split(',').map((s) => s.trim().replace(/'/g, ''))
+  const routeStatuses = ROUTE.match(/const PRICEABLE_STATUSES = \[([^\]]*)\]/)[1].split(',').map((s) => s.trim().replace(/'/g, ''))
+  assert.deepEqual(routeStatuses, dbStatuses, 'status precificáveis divergentes entre route e banco')
+  const ag = lfRead('app/dashboard/agenda/page.js')
+  assert.ok(ag.includes("if (edit && saved.price_review_required) toast.warning('Reserva atualizada. O valor foi mantido porque existem lançamentos financeiros. Revise o valor da reserva.')"), 'aviso ausente')
+  assert.ok(!/price_source/.test(ag), 'UI não pode enviar/decidir price_source')
+})
+await check('P3A-37 rollback SQL dos fixes: casos obrigatórios presentes e tudo desfeito', () => {
+  const sql = lfRead('tests/phase3a_fix_rollback.sql')
+  assert.ok(sql.includes('P3A_FIX_RESULTS') && /\nrollback;\s*$/.test(sql))
+  for (const t of ["'V01b OWNER recebe void_reason e voided_by'", "'V02b MANAGER recebe void_reason e voided_by'", "'V03b RECEPTIONIST recebe voided_at, SEM void_reason e SEM voided_by'",
+    "'V05 outro tenant => P0002'", "'R01 horário", "'R02 duração", "'R03 data", "'R04 quadra", "'R05 faixa sem regra", "'R06 sem valor volta para faixa com regra",
+    "'R09 cross-midnight", "'R10b MANUAL preservado", "'R11b legado preservado", "'R12b valor preservado", "'R13b estorno não anulado impede", "'R14b recalcula",
+    "'R15b SERIES preservado", "'S01 ordem EXATA dos BEFORE UPDATE", "'S03 RECEPTIONIST altera price_source direto => 42501'", "'S06 OWNER altera price direto continua 42501'",
+    "'S07 cliente muda horário + price na mesma instrução", "'S09 PAID continua bloqueado", "'F01 falha após o audit do recálculo"])
+    assert.ok(sql.includes(t), `caso ausente: ${t}`)
 })
 
 const fail = results.filter((r) => r[1] === 'FAIL').length

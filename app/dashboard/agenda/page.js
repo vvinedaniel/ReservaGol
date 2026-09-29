@@ -269,7 +269,10 @@ function ReservationDialog({ open, onClose, orgId, arenaId, date, courts, initia
     setSaving(false)
     if (res.status === 409) { toast.error('Horário indisponível', { description: 'Este horário acabou de ficar indisponível. Escolha outro horário.' }); onSaved(); return }
     if (!res.ok) { const e = await res.json().catch(() => ({})); toast.error('Não foi possível salvar', { description: e.error }); return }
-    toast.success(edit ? 'Reserva atualizada' : 'Reserva criada')
+    const saved = await res.json().catch(() => ({}))
+    // 03A FIX2: com lançamento financeiro ativo o banco preserva o valor ao mudar data/horário/quadra.
+    if (edit && saved.price_review_required) toast.warning('Reserva atualizada. O valor foi mantido porque existem lançamentos financeiros. Revise o valor da reserva.')
+    else toast.success(edit ? 'Reserva atualizada' : 'Reserva criada')
     onClose(); onSaved()
   }
 

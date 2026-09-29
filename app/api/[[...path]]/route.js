@@ -346,6 +346,8 @@ function financeErrorResponse(error, ctx = {}) {
   console.error('rpc financeiro', ctx.op || '?', code || 'sem código')
   return json({ error: 'Erro interno do servidor' }, 500)
 }
+// Status em que a reserva é precificável/cobrável (mesma lista do recálculo no banco — FIX2).
+const PRICEABLE_STATUSES = ['PENDING', 'CONFIRMED', 'NO_SHOW']
 function validCents(v, { min = 0 } = {}) { return Number.isSafeInteger(v) && v >= min && v <= 10000000 }
 function validInstant(v) { return typeof v === 'string' && v.length <= 40 && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v) && !Number.isNaN(Date.parse(v)) }
 function validOptionalDate(v) { return v === null || v === undefined || v === '' || isRealDate(v) }
@@ -812,7 +814,8 @@ async function handleRoute(request, { params }) {
         const body = await readBody(request)
         // 03A: o valor (snapshot) só muda pela ação de valor (RPC rg_reservation_set_price).
         if (body.price !== undefined) return json({ error: 'O valor da reserva é alterado pela ação "Alterar valor".' }, 400)
-        const { data: before } = await supabase.from('reservations').select('recurring_reservation_id,status').eq('id', id).maybeSingle()
+        if (body.price_source !== undefined) return json({ error: 'A origem do valor é definida pelo sistema.' }, 400)
+        const { data: before } = await supabase.from('reservations').select('*').eq('id', id).maybeSingle()
         const patch = {}
         if (body.court_id !== undefined) patch.court_id = body.court_id
         // Status: allowlist sem PAID (D15). Reenviar o status atual (ex.: legado) não é uma mudança.
@@ -834,7 +837,18 @@ async function handleRoute(request, { params }) {
         if (error) return json({ error: isConflict(error) ? CONFLICT_MSG : 'Não foi possível salvar a reserva' }, isConflict(error) ? 409 : 400)
         const updAction = before?.recurring_reservation_id ? 'RECURRING_OCCURRENCE_UPDATED' : 'RESERVATION_UPDATED'
         await supabase.from('audit_logs').insert({ organization_id: data?.organization_id, user_id: user.id, action: updAction, entity_type: 'reservation', entity_id: id, metadata: { recurring_reservation_id: before?.recurring_reservation_id || null } })
-        return json(data)
+        // 03A FIX2: ao mudar data/horário/quadra o BANCO recalcula o valor automático (trigger), exceto
+        // com lançamento financeiro ativo — aí o valor é preservado e a UI avisa para revisar.
+        const scheduleChanged = !!before && !!data && (data.court_id !== before.court_id
+          || Date.parse(data.start_at) !== Date.parse(before.start_at) || Date.parse(data.end_at) !== Date.parse(before.end_at))
+        let price_review_required = false
+        if (scheduleChanged && !data.recurring_reservation_id && PRICEABLE_STATUSES.includes(data.status)
+            && (before.price_source === 'RULE' || (before.price == null && before.price_source == null))) {
+          const { data: fin } = await supabase.rpc('rg_reservation_financial_detail', { p_reservation_id: id })
+          price_review_required = Array.isArray(fin?.entries) && fin.entries.some((e) => !e.voided_at)
+        }
+        const price_recalculated = scheduleChanged && (data.price !== before.price || (data.price_source ?? null) !== (before.price_source ?? null))
+        return json({ ...data, price_recalculated, price_review_required })
       }
       if (method === 'POST') {
         const body = await readBody(request)
@@ -842,6 +856,7 @@ async function handleRoute(request, { params }) {
         if (sameTime(body.start_time, body.end_time)) return json({ error: SAME_TIME_MSG }, 400)
         // 03A: preço nunca vem do cliente (snapshot pela tabela de preços no banco); status sem PAID.
         if (body.price !== undefined) return json({ error: 'O valor da reserva é definido pela tabela de preços.' }, 400)
+        if (body.price_source !== undefined) return json({ error: 'A origem do valor é definida pelo sistema.' }, 400)
         const status = body.status || 'CONFIRMED'
         if (!CREATE_STATUSES.includes(status)) return json({ error: 'Status inválido' }, 400)
         let customer_id = null
