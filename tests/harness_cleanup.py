@@ -27,7 +27,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-ORG_TABLES = ['reservations', 'recurring_reservations', 'customers', 'business_hours', 'courts', 'arenas', 'audit_logs', 'organization_members']
+ORG_TABLES = ['reservation_payments', 'court_pricing_rules', 'reservations', 'recurring_reservations', 'customers', 'business_hours',
+              'courts', 'arenas', 'audit_logs', 'organization_members']
+# FASE 03A: tabelas que só existem depois da migration_phase3a_foundation.sql. Antes dela, a leitura
+# devolve 404 (tabela inexistente) e conta 0 — os harnesses antigos continuam funcionando.
+OPTIONAL_TABLES = {'reservation_payments', 'court_pricing_rules'}
 
 
 def clean_br_phone(v):
@@ -91,6 +95,8 @@ class FixtureTracker:
 
     def _rows(self, table, params):
         s, b = self._http('GET', f'/rest/v1/{table}?{urllib.parse.urlencode(params, doseq=True)}')
+        if s == 404 and table in OPTIONAL_TABLES:
+            return []
         if s != 200 or not isinstance(b, list):
             raise RuntimeError(f'leitura {table}: HTTP {s}')
         return b
@@ -131,6 +137,11 @@ class FixtureTracker:
         created = self._count(owned + doubtful)
         if owned:
             flt = f'in.({",".join(owned)})'
+            # 03A: ledger antes das reservas (FK RESTRICT); estornos antes dos pagamentos (refund_of RESTRICT).
+            # O banco só permite DELETE no ledger/tabela de preços de organização demo (fixtures).
+            self._http('DELETE', f'/rest/v1/reservation_payments?organization_id={flt}&kind=eq.REFUND', 'return=minimal')
+            self._http('DELETE', f'/rest/v1/reservation_payments?organization_id={flt}', 'return=minimal')
+            self._http('DELETE', f'/rest/v1/court_pricing_rules?organization_id={flt}', 'return=minimal')
             self._http('DELETE', f'/rest/v1/reservations?organization_id={flt}', 'return=minimal')
             for _ in range(50):  # séries: folhas primeiro (previous_series_id é FK RESTRICT)
                 rows = self._rows('recurring_reservations', {'organization_id': flt, 'select': 'id,previous_series_id'})

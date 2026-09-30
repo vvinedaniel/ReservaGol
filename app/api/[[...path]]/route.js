@@ -6,6 +6,8 @@ import { timeToMin, closeTimeToMin, crossesMidnight, intervalEndMin, buildSlots,
 import { RATE_LIMITS, clientIp, consumeRateLimit } from '@/lib/reserva/rate-limit'
 import { insertWithPublicCode } from '@/lib/reserva/public-code'
 import { PUBLIC_ERRORS, isUuid, isValidSlug, isHHMM, isRealDate, checkPublicDate, safeSlotMinutes, publicSlots, findSlot, slotStarted, cleanName, cleanBrPhone, cleanEmail, cleanIdempotencyKey } from '@/lib/reserva/public-booking'
+import { CREATE_STATUSES, EDIT_STATUSES } from '@/lib/reserva/status'
+import { PAYMENT_METHODS, PRICE_REASONS, normalizeFinanceNotes, NOTES_MAX_CHARS } from '@/lib/reserva/finance'
 
 // B1: sem headers CORS — a API só é consumida pelo próprio frontend (mesma origem).
 function json(data, status = 200) {
@@ -308,6 +310,47 @@ async function loadSeriesSafe(db, id) {
   return data || null
 }
 
+
+// ---- FASE 03A: financeiro (RPCs rg_* da migration_phase3a_foundation.sql) ----
+// Toda escrita financeira (pagamento, estorno, anulação, valor, regras de preço) acontece em RPC
+// SECURITY DEFINER com auditoria no banco. O route só valida formato e mapeia a resposta.
+// organization_id do body NUNCA é usado: o tenant é derivado no banco (arena/quadra/reserva/lançamento).
+const PRICING_RULE_COLUMNS = 'id,organization_id,arena_id,court_id,scope_kind,weekday,start_time,end_time,price_per_hour,valid_from,valid_until,active,created_at,updated_at,court:courts(id,name)'
+const FINANCE_STATE_MSG = 'A situação atual não permite esta operação financeira. Atualize e tente novamente.'
+// Mensagens por HINT estável das exceções RGP01/RGP03 (nunca o texto interno da exceção).
+const FINANCE_HINT_MSG = {
+  RESERVATION_STATE: 'A situação desta reserva não permite registrar pagamento.',
+  UNPRICED: 'Defina o valor da reserva antes de registrar o pagamento.',
+  OVER_BALANCE: 'O valor informado é maior que o saldo a receber.',
+  NOT_A_PAYMENT: 'Somente pagamentos podem ser estornados.',
+  PAYMENT_VOIDED: 'Este pagamento foi anulado e não pode ser estornado.',
+  OVER_REFUNDABLE: 'O estorno é maior que o valor disponível deste pagamento.',
+  HAS_REFUNDS: 'Anule primeiro os estornos deste pagamento.',
+  BLOCKED: 'Bloqueios de horário não têm valor.',
+  NO_RULE: 'Nenhuma regra de preço cobre este horário.',
+  PRICE_REQUIRED: 'Uma reserva com valor recebido não pode ficar sem preço.',
+  RULE_INACTIVE: 'Esta regra de preço está desativada.',
+}
+function financeErrorResponse(error, ctx = {}) {
+  const code = error?.code
+  const hintMsg = FINANCE_HINT_MSG[error?.hint]
+  if (code === '42501') return json({ error: ctx.forbidden || 'Sem permissão para esta operação financeira' }, 403)
+  if (code === 'P0002') return json({ error: ctx.notFound || 'Registro não encontrado' }, 404)
+  if (code === 'RGP02') return json({ error: IDEMPOTENCY_MISMATCH_MSG, code: 'IDEMPOTENCY_MISMATCH' }, 409)
+  if (code === 'RGP01') return json({ error: hintMsg || FINANCE_STATE_MSG, code: 'FINANCE_STATE' }, 409)
+  if (code === 'RGP03') return json({ error: hintMsg || 'Valor acima do permitido para esta operação.', code: 'FINANCE_LIMIT' }, 409)
+  if (code === '23P01') return json({ error: 'Já existe uma regra de preço ativa que cobre este horário.', code: 'PRICING_OVERLAP' }, 409)
+  if (isTenantViolation(error)) return json({ error: TENANT_MSG }, 400)
+  if (['22023', '23514', '23502', '23503', '22P02', '22007', '22008', 'P0001'].includes(code)) return json({ error: ctx.invalid || 'Dados inválidos para esta operação' }, 400)
+  if (['40P01', '40001', '55P03'].includes(code)) return json({ error: 'Operação concorrente em andamento. Tente novamente em instantes.' }, 503)
+  console.error('rpc financeiro', ctx.op || '?', code || 'sem código')
+  return json({ error: 'Erro interno do servidor' }, 500)
+}
+// Status em que a reserva é precificável/cobrável (mesma lista do recálculo no banco — FIX2).
+const PRICEABLE_STATUSES = ['PENDING', 'CONFIRMED', 'NO_SHOW']
+function validCents(v, { min = 0 } = {}) { return Number.isSafeInteger(v) && v >= min && v <= 10000000 }
+function validInstant(v) { return typeof v === 'string' && v.length <= 40 && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v) && !Number.isNaN(Date.parse(v)) }
+function validOptionalDate(v) { return v === null || v === undefined || v === '' || isRealDate(v) }
 
 // Resolve or create a customer within the organization (never across orgs). Phone normalized.
 async function resolveCustomerId(supabase, { organization_id, arena_id, customer_id, customer }) {
@@ -707,6 +750,55 @@ async function handleRoute(request, { params }) {
         await supabase.from('audit_logs').insert({ organization_id: body.organization_id, user_id: user.id, action: 'TIME_BLOCK_CREATED', entity_type: 'reservation', entity_id: data?.id, metadata: { reason: body.reason || null } })
         return json(data, 201)
       }
+      // ---- 03A: financeiro da reserva (antes dos handlers genéricos de PUT/POST desta rota) ----
+      // POST /reservations/financial-summaries {reservation_ids[]} -> status por reserva (valores só p/ OWNER/MANAGER).
+      if (id === 'financial-summaries' && method === 'POST') {
+        const body = await readBody(request)
+        const ids = Array.isArray(body.reservation_ids) ? body.reservation_ids : null
+        if (!ids || ids.length > 500 || !ids.every(isUuid)) return json({ error: 'Lista de reservas inválida' }, 400)
+        if (!ids.length) return json([])
+        const { data, error } = await supabase.rpc('rg_reservation_financial_summaries', { p_reservation_ids: ids })
+        if (error) return financeErrorResponse(error, { op: 'summaries' })
+        return json(data || [])
+      }
+      // GET /reservations/:id/financials -> resumo + lançamentos de UMA reserva (qualquer membro).
+      if (id && sub === 'financials' && method === 'GET') {
+        if (!isUuid(id)) return json({ error: 'Reserva não encontrada' }, 404)
+        const { data, error } = await supabase.rpc('rg_reservation_financial_detail', { p_reservation_id: id })
+        if (error) return financeErrorResponse(error, { op: 'detail', notFound: 'Reserva não encontrada' })
+        return json(data)
+      }
+      // POST /reservations/:id/payments -> registrar PAYMENT (qualquer membro). operation_id + received_at
+      // são gerados UMA vez pela UI por intenção e reenviados iguais no retry (replay idempotente).
+      if (id && sub === 'payments' && method === 'POST') {
+        const body = await readBody(request)
+        if (!isUuid(id)) return json({ error: 'Reserva não encontrada' }, 404)
+        if (!validOperationId(body.operation_id)) return json({ error: 'Operação inválida. Atualize a página e tente novamente.' }, 400)
+        if (!PAYMENT_METHODS.includes(body.method)) return json({ error: 'Meio de pagamento inválido' }, 400)
+        if (!validCents(body.amount, { min: 1 })) return json({ error: 'Valor inválido' }, 400)
+        if (!validInstant(body.received_at)) return json({ error: 'Data do recebimento inválida' }, 400)
+        const notes = normalizeFinanceNotes(body.notes)
+        if (!notes.ok) return json({ error: `Observação inválida (máximo de ${NOTES_MAX_CHARS} caracteres)` }, 400)
+        const { data, error } = await supabase.rpc('rg_payment_register', {
+          p_operation_id: body.operation_id, p_reservation_id: id, p_method: body.method, p_amount: body.amount,
+          p_received_at: body.received_at, p_notes: notes.value,
+        })
+        if (error) return financeErrorResponse(error, { op: 'payment', notFound: 'Reserva não encontrada' })
+        return json(data, data?.idempotent ? 200 : 201)
+      }
+      // PUT /reservations/:id/price -> única alteração legítima do snapshot (OWNER/MANAGER; RPC).
+      if (id && sub === 'price' && method === 'PUT') {
+        const body = await readBody(request)
+        if (!isUuid(id)) return json({ error: 'Reserva não encontrada' }, 404)
+        if (!['MANUAL', 'RULE'].includes(body.mode)) return json({ error: 'Modo inválido' }, 400)
+        if (!PRICE_REASONS.includes(body.reason)) return json({ error: 'Motivo inválido' }, 400)
+        if (body.mode === 'MANUAL' && body.price !== null && !validCents(body.price)) return json({ error: 'Valor inválido' }, 400)
+        const { data, error } = await supabase.rpc('rg_reservation_set_price', {
+          p_reservation_id: id, p_mode: body.mode, p_price: body.mode === 'MANUAL' ? body.price : null, p_reason: body.reason,
+        })
+        if (error) return financeErrorResponse(error, { op: 'set_price', notFound: 'Reserva não encontrada', forbidden: 'Sem permissão para alterar o valor' })
+        return json(data)
+      }
       if (id && sub === 'cancel' && method === 'POST') {
         const body = await readBody(request)
         const { data: current } = await supabase.from('reservations').select('*').eq('id', id).maybeSingle()
@@ -720,13 +812,19 @@ async function handleRoute(request, { params }) {
       }
       if (id && method === 'PUT') {
         const body = await readBody(request)
-        const { data: before } = await supabase.from('reservations').select('recurring_reservation_id').eq('id', id).maybeSingle()
+        // 03A: o valor (snapshot) só muda pela ação de valor (RPC rg_reservation_set_price).
+        if (body.price !== undefined) return json({ error: 'O valor da reserva é alterado pela ação "Alterar valor".' }, 400)
+        if (body.price_source !== undefined) return json({ error: 'A origem do valor é definida pelo sistema.' }, 400)
+        const { data: before } = await supabase.from('reservations').select('*').eq('id', id).maybeSingle()
         const patch = {}
         if (body.court_id !== undefined) patch.court_id = body.court_id
-        if (body.status !== undefined) patch.status = body.status
+        // Status: allowlist sem PAID (D15). Reenviar o status atual (ex.: legado) não é uma mudança.
+        if (body.status !== undefined && body.status !== before?.status) {
+          if (!EDIT_STATUSES.includes(body.status)) return json({ error: 'Status inválido' }, 400)
+          patch.status = body.status
+        }
         if (body.source !== undefined) patch.source = body.source
         if (body.notes !== undefined) patch.notes = body.notes
-        if (body.price !== undefined) patch.price = body.price
         if (body.date && body.start_time && body.end_time && sameTime(body.start_time, body.end_time)) return json({ error: SAME_TIME_MSG }, 400)
         if (body.date && body.start_time) patch.start_at = toISO(body.date, body.start_time)
         if (body.date && body.end_time) patch.end_at = body.start_time ? endISO(body.date, body.start_time, body.end_time) : toISO(body.date, body.end_time)
@@ -739,18 +837,34 @@ async function handleRoute(request, { params }) {
         if (error) return json({ error: isConflict(error) ? CONFLICT_MSG : 'Não foi possível salvar a reserva' }, isConflict(error) ? 409 : 400)
         const updAction = before?.recurring_reservation_id ? 'RECURRING_OCCURRENCE_UPDATED' : 'RESERVATION_UPDATED'
         await supabase.from('audit_logs').insert({ organization_id: data?.organization_id, user_id: user.id, action: updAction, entity_type: 'reservation', entity_id: id, metadata: { recurring_reservation_id: before?.recurring_reservation_id || null } })
-        return json(data)
+        // 03A FIX2: ao mudar data/horário/quadra o BANCO recalcula o valor automático (trigger), exceto
+        // com lançamento financeiro ativo — aí o valor é preservado e a UI avisa para revisar.
+        const scheduleChanged = !!before && !!data && (data.court_id !== before.court_id
+          || Date.parse(data.start_at) !== Date.parse(before.start_at) || Date.parse(data.end_at) !== Date.parse(before.end_at))
+        let price_review_required = false
+        if (scheduleChanged && !data.recurring_reservation_id && PRICEABLE_STATUSES.includes(data.status)
+            && (before.price_source === 'RULE' || (before.price == null && before.price_source == null))) {
+          const { data: fin } = await supabase.rpc('rg_reservation_financial_detail', { p_reservation_id: id })
+          price_review_required = Array.isArray(fin?.entries) && fin.entries.some((e) => !e.voided_at)
+        }
+        const price_recalculated = scheduleChanged && (data.price !== before.price || (data.price_source ?? null) !== (before.price_source ?? null))
+        return json({ ...data, price_recalculated, price_review_required })
       }
       if (method === 'POST') {
         const body = await readBody(request)
         if (!body.organization_id || !body.arena_id || !body.court_id || !body.date || !body.start_time || !body.end_time) return json({ error: 'Dados obrigatórios ausentes' }, 400)
         if (sameTime(body.start_time, body.end_time)) return json({ error: SAME_TIME_MSG }, 400)
+        // 03A: preço nunca vem do cliente (snapshot pela tabela de preços no banco); status sem PAID.
+        if (body.price !== undefined) return json({ error: 'O valor da reserva é definido pela tabela de preços.' }, 400)
+        if (body.price_source !== undefined) return json({ error: 'A origem do valor é definida pelo sistema.' }, 400)
+        const status = body.status || 'CONFIRMED'
+        if (!CREATE_STATUSES.includes(status)) return json({ error: 'Status inválido' }, 400)
         let customer_id = null
         try { customer_id = await resolveCustomerId(supabase, body) } catch { return json({ error: 'Não foi possível salvar o cliente' }, 400) }
         const { data, error } = await supabase.from('reservations').insert({
           organization_id: body.organization_id, arena_id: body.arena_id, court_id: body.court_id, customer_id,
           start_at: toISO(body.date, body.start_time), end_at: endISO(body.date, body.start_time, body.end_time),
-          status: body.status || 'CONFIRMED', source: body.source || 'RECEPÇÃO', notes: body.notes || null, created_by: user.id,
+          status, source: body.source || 'RECEPÇÃO', notes: body.notes || null, created_by: user.id,
         }).select('*, customer:customers(id,name,phone), court:courts(id,name)').maybeSingle()
         if (isTenantViolation(error)) return json({ error: TENANT_MSG }, 400)
         if (error) return json({ error: isConflict(error) ? CONFLICT_MSG : 'Não foi possível criar a reserva' }, isConflict(error) ? 409 : 400)
@@ -1066,6 +1180,98 @@ async function handleRoute(request, { params }) {
           if (e instanceof PreviewUnavailableError) return json({ error: PREVIEW_UNAVAILABLE_MSG }, 503)
           throw e
         }
+      }
+    }
+
+    // ------------------------------------------------ 03A: tabela de preços
+    // Leitura por RLS (membro). Escrita SOMENTE por RPC (OWNER/MANAGER; audit no banco).
+    if (resource === 'pricing-rules') {
+      if (method === 'GET' && !id) {
+        const arena_id = url.searchParams.get('arena_id')
+        if (!isUuid(arena_id)) return json({ error: 'arena_id é obrigatório' }, 400)
+        let q = supabase.from('court_pricing_rules').select(PRICING_RULE_COLUMNS).eq('arena_id', arena_id)
+        if (url.searchParams.get('include_inactive') !== '1') q = q.eq('active', true)
+        const { data, error } = await q.order('weekday', { ascending: true }).order('start_time', { ascending: true })
+        if (error) throw error
+        return json(data || [])
+      }
+      // POST: UMA ação do usuário (vários dias + uma faixa) = UMA chamada RPC = UMA transação.
+      // Todos os dias (e metades cross-midnight) são criados juntos, ou nenhum.
+      if (method === 'POST' && !id) {
+        const body = await readBody(request)
+        if (!isUuid(body.arena_id) || (body.court_id != null && !isUuid(body.court_id))) return json({ error: 'Arena ou quadra inválida' }, 400)
+        const wds = body.weekdays
+        if (!Array.isArray(wds) || wds.length < 1 || wds.length > 7 || !wds.every((d) => Number.isInteger(d) && d >= 0 && d <= 6) || new Set(wds).size !== wds.length) {
+          return json({ error: 'Selecione de 1 a 7 dias da semana, sem repetição' }, 400)
+        }
+        if (!isHHMM(body.start_time) || !isHHMM(body.end_time)) return json({ error: 'Horário inválido' }, 400)
+        if (!validCents(body.price_per_hour)) return json({ error: 'Valor por hora inválido' }, 400)
+        if (!validOptionalDate(body.valid_from) || !validOptionalDate(body.valid_until)) return json({ error: 'Validade inválida' }, 400)
+        const { data, error } = await supabase.rpc('rg_pricing_rule_create', {
+          p_arena_id: body.arena_id, p_court_id: body.court_id || null, p_weekdays: wds,
+          p_start_time: body.start_time, p_end_time: body.end_time, p_price_per_hour: body.price_per_hour,
+          p_valid_from: body.valid_from || null, p_valid_until: body.valid_until || null,
+        })
+        if (error) return financeErrorResponse(error, { op: 'pricing_create', forbidden: 'Sem permissão para gerenciar preços', notFound: 'Arena ou quadra não encontrada' })
+        return json(data, 201)
+      }
+      if (method === 'PUT' && id && !sub) {
+        const body = await readBody(request)
+        if (!isUuid(id)) return json({ error: 'Regra não encontrada' }, 404)
+        const changes = {}
+        if (body.start_time !== undefined) { if (!isHHMM(body.start_time)) return json({ error: 'Horário inválido' }, 400); changes.start_time = body.start_time }
+        if (body.end_time !== undefined) { if (!isHHMM(body.end_time)) return json({ error: 'Horário inválido' }, 400); changes.end_time = body.end_time }
+        if (body.price_per_hour !== undefined) { if (!validCents(body.price_per_hour)) return json({ error: 'Valor por hora inválido' }, 400); changes.price_per_hour = body.price_per_hour }
+        if (body.valid_from !== undefined) { if (!validOptionalDate(body.valid_from)) return json({ error: 'Validade inválida' }, 400); changes.valid_from = body.valid_from || null }
+        if (body.valid_until !== undefined) { if (!validOptionalDate(body.valid_until)) return json({ error: 'Validade inválida' }, 400); changes.valid_until = body.valid_until || null }
+        const { data, error } = await supabase.rpc('rg_pricing_rule_update', { p_rule_id: id, p_changes: changes })
+        if (error) return financeErrorResponse(error, { op: 'pricing_update', forbidden: 'Sem permissão para gerenciar preços', notFound: 'Regra não encontrada' })
+        return json(data)
+      }
+      if (method === 'POST' && id && sub === 'deactivate') {
+        if (!isUuid(id)) return json({ error: 'Regra não encontrada' }, 404)
+        const { data, error } = await supabase.rpc('rg_pricing_rule_deactivate', { p_rule_id: id })
+        if (error) return financeErrorResponse(error, { op: 'pricing_deactivate', forbidden: 'Sem permissão para gerenciar preços', notFound: 'Regra não encontrada' })
+        return json(data)
+      }
+    }
+
+    // GET /pricing/quote?court_id=&date=&start_time=&end_time= -> cotação (qualquer membro).
+    if (resource === 'pricing' && id === 'quote' && method === 'GET') {
+      const court_id = url.searchParams.get('court_id'); const date = url.searchParams.get('date')
+      const start_time = url.searchParams.get('start_time'); const end_time = url.searchParams.get('end_time')
+      if (!isUuid(court_id) || !isRealDate(date) || !isHHMM(start_time) || !isHHMM(end_time)) return json({ error: 'Parâmetros inválidos' }, 400)
+      if (sameTime(start_time, end_time)) return json({ error: SAME_TIME_MSG }, 400)
+      const { data, error } = await supabase.rpc('rg_price_quote', { p_court_id: court_id, p_start_at: toISO(date, start_time), p_end_at: endISO(date, start_time, end_time) })
+      if (error) return financeErrorResponse(error, { op: 'quote', notFound: 'Quadra não encontrada' })
+      return json(data)
+    }
+
+    // ------------------------------------------------ 03A: estorno / anulação (OWNER/MANAGER; RPC)
+    if (resource === 'payments' && id) {
+      if (!isUuid(id)) return json({ error: 'Lançamento não encontrado' }, 404)
+      if (sub === 'refund' && method === 'POST') {
+        const body = await readBody(request)
+        if (!validOperationId(body.operation_id)) return json({ error: 'Operação inválida. Atualize a página e tente novamente.' }, 400)
+        if (!PAYMENT_METHODS.includes(body.method)) return json({ error: 'Meio de pagamento inválido' }, 400)
+        if (!validCents(body.amount, { min: 1 })) return json({ error: 'Valor inválido' }, 400)
+        if (!validInstant(body.received_at)) return json({ error: 'Data do estorno inválida' }, 400)
+        const notes = normalizeFinanceNotes(body.notes)
+        if (!notes.ok) return json({ error: `Observação inválida (máximo de ${NOTES_MAX_CHARS} caracteres)` }, 400)
+        const { data, error } = await supabase.rpc('rg_payment_refund', {
+          p_operation_id: body.operation_id, p_payment_id: id, p_method: body.method, p_amount: body.amount,
+          p_received_at: body.received_at, p_notes: notes.value,
+        })
+        if (error) return financeErrorResponse(error, { op: 'refund', forbidden: 'Sem permissão para estornar', notFound: 'Pagamento não encontrado' })
+        return json(data, data?.idempotent ? 200 : 201)
+      }
+      if (sub === 'void' && method === 'POST') {
+        const body = await readBody(request)
+        const reason = typeof body.reason === 'string' ? body.reason.trim() : ''
+        if (!reason || reason.length > 500) return json({ error: 'Informe o motivo da anulação' }, 400)
+        const { data, error } = await supabase.rpc('rg_payment_void', { p_payment_id: id, p_reason: reason })
+        if (error) return financeErrorResponse(error, { op: 'void', forbidden: 'Sem permissão para anular', notFound: 'Lançamento não encontrado' })
+        return json(data)
       }
     }
 

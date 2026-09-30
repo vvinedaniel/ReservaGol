@@ -5,6 +5,8 @@ import { useMe } from '@/components/reserva/dashboard-shell'
 import { EmptyState } from '@/components/reserva/empty-state'
 import { statusMeta, STATUS_META, RESERVATION_STATUSES, SOURCES } from '@/lib/reserva/status'
 import { fmtTime, fmtDateTimeLong } from '@/lib/reserva/time'
+import { FinancePanel, PaymentStatusBadge, fetchPaymentSummaries } from '@/components/reserva/finance-panel'
+import { formatCents } from '@/lib/reserva/money'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -46,6 +48,13 @@ export default function ReservasPage() {
     setLoading(false)
   }, [orgId, scope, q, f])
   useEffect(() => { const t = setTimeout(load, 250); return () => clearTimeout(t) }, [load])
+  // 03A: status de pagamento das linhas listadas (a recepção recebe só o status, sem valores).
+  const [pay, setPay] = useState({})
+  useEffect(() => {
+    let alive = true
+    fetchPaymentSummaries(rows.filter((r) => r.status !== 'BLOCKED').map((r) => r.id)).then((m) => { if (alive) setPay(m) })
+    return () => { alive = false }
+  }, [rows])
 
   return (
     <div className="space-y-5">
@@ -88,7 +97,7 @@ export default function ReservasPage() {
               <thead className="bg-card text-xs uppercase text-muted-foreground">
                 <tr>
                   <th className="p-3 text-left">Horário</th><th className="p-3 text-left">Cliente</th><th className="p-3 text-left">Telefone</th>
-                  <th className="p-3 text-left">Quadra</th><th className="p-3 text-left">Origem</th><th className="p-3 text-left">Status</th>
+                  <th className="p-3 text-left">Quadra</th><th className="p-3 text-left">Origem</th><th className="p-3 text-left">Status</th><th className="p-3 text-left">Pagamento</th>
                 </tr>
               </thead>
               <tbody>
@@ -102,6 +111,7 @@ export default function ReservasPage() {
                       <td className="p-3">{r.court?.name || '—'}</td>
                       <td className="p-3 text-muted-foreground">{r.source || '—'}</td>
                       <td className="p-3"><Badge className={cn('border', m.badge)}>{m.label}</Badge></td>
+                      <td className="p-3">{pay[r.id] ? <PaymentStatusBadge status={pay[r.id].payment_status} /> : <span className="text-muted-foreground">—</span>}</td>
                     </tr>
                   )
                 })}
@@ -118,7 +128,10 @@ export default function ReservasPage() {
                       <p className="font-medium">{fmtTime(r.start_at)}–{fmtTime(r.end_at)} · {r.court?.name}</p>
                       <p className="text-sm text-muted-foreground">{r.status === 'BLOCKED' ? (r.notes || 'Bloqueio') : (r.customer?.name || '—')}</p>
                     </div>
-                    <Badge className={cn('border', m.badge)}>{m.label}</Badge>
+                    <div className="flex flex-col items-end gap-1">
+                      <Badge className={cn('border', m.badge)}>{m.label}</Badge>
+                      {pay[r.id] && <PaymentStatusBadge status={pay[r.id].payment_status} />}
+                    </div>
                   </CardContent>
                 </Card>
               )
@@ -127,13 +140,14 @@ export default function ReservasPage() {
         </>
       )}
 
-      {detail && <DetailSheet res={detail} onClose={() => setDetail(null)} onChanged={load} />}
+      {detail && <DetailSheet res={detail} role={me?.role} onClose={() => setDetail(null)} onChanged={load} />}
     </div>
   )
 }
 
-function DetailSheet({ res, onClose, onChanged }) {
+function DetailSheet({ res, role, onClose, onChanged }) {
   const m = statusMeta(res.status)
+  const [fin, setFin] = useState(null)
   const [cancelling, setCancelling] = useState(false)
   async function doCancel() {
     setCancelling(true)
@@ -157,6 +171,10 @@ function DetailSheet({ res, onClose, onChanged }) {
           <Row label="Origem" value={res.source} />
           <Row label="Observações" value={res.notes} />
         </div>
+        {res.status !== 'BLOCKED' && <FinancePanel reservationId={res.id} role={role} onLoaded={setFin} onChanged={onChanged} />}
+        {res.status !== 'CANCELLED' && fin?.net_received > 0 && (
+          <p className="mt-4 text-xs text-amber-500">Esta reserva tem {formatCents(fin.net_received)} recebidos. Cancelar não devolve o dinheiro: o valor fica retido até um gerente registrar o estorno.</p>
+        )}
         {res.status !== 'CANCELLED' && (
           <Button variant="destructive" className="mt-5 w-full" onClick={doCancel} disabled={cancelling}>{cancelling && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}<X className="mr-2 h-4 w-4" /> Cancelar reserva</Button>
         )}

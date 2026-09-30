@@ -223,26 +223,84 @@ function fnBody(src, header) {
   }
   throw new Error(`corpo não fechado: ${header}`)
 }
-await check('B3-18 create/reschedule: try/catch/finally; catch mantém a chave; finally libera busy; chave gerada uma vez', () => {
-  for (const [file, header] of [['app/dashboard/mensalistas/page.js', 'async function create(skip_conflicts)'], ['app/dashboard/agenda/page.js', 'async function apply(skip)']]) {
-    const src = read(file)
-    const body = fnBody(src, header)
-    const iTry = body.indexOf('try {\n') >= 0 ? body.indexOf('try {\n') : body.indexOf('try {\r\n')
+// operation_id = UMA intenção do usuário:
+//   retry / erro de rede / erro HTTP / needs_decision sem edição => MANTÉM a chave;
+//   campo da intenção alterado (valor diferente) => DESCARTA a chave via invalidateIntentOnChange
+//   (e, no reagendamento, os conflitos da intenção anterior); valor igual => não invalida.
+// Nenhum outro ponto (catch, finally, erro HTTP, load, render) pode limpar ou trocar a chave.
+const stripJs = (s) => s.replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+const B3_DIALOGS = [
+  { file: 'app/dashboard/mensalistas/page.js', start: 'function CreateDialog(', end: 'function DetailSheet(', send: 'async function create(skip_conflicts)', conflicts: false },
+  { file: 'app/dashboard/agenda/page.js', start: 'function RescheduleDialog(', end: 'function WeekView(', send: 'async function apply(skip)', conflicts: true },
+]
+await check('B3-18 operation_id = UMA intenção: retry/rede/needs_decision mantêm; edição real (helper) descarta; nada mais limpa', async () => {
+  // C) helper: só limpa quando o valor muda; não gera chave; sem rede/efeitos além de limpar a anterior
+  const { invalidateIntentOnChange } = await import('../lib/reserva/intent.js')
+  const helper = stripJs(read('lib/reserva/intent.js'))
+  assert.ok(!/fetch\(|newOperationId|randomUUID|getRandomValues|\bimport\b|await\b/.test(helper), 'helper com rede/geração de chave')
+  assert.deepEqual(helper.match(/\w+\.current\s*=(?!=)[^\n]*/g), ['keyRef.current = null'], 'helper só pode limpar a chave')
+  const ref = { current: 'op-1' }
+  assert.equal(invalidateIntentOnChange({ a: '1' }, 'a', '1', ref), false)
+  assert.equal(ref.current, 'op-1', 'valor igual invalidou a intenção')
+  assert.equal(invalidateIntentOnChange({ a: '1' }, 'a', '2', ref), true)
+  assert.equal(ref.current, null, 'edição real não limpou a chave')
+  invalidateIntentOnChange({ a: '1' }, 'a', '3', ref)
+  assert.equal(ref.current, null, 'helper gerou chave nova')
+
+  for (const d of B3_DIALOGS) {
+    const src = stripJs(read(d.file))
+    const dialog = src.slice(src.indexOf(d.start), src.indexOf(d.end))
+    assert.ok(dialog.length > 200, `${d.file}: dialog não encontrado`)
+    // D) inventário completo das referências à chave no arquivo: só os usos aprovados, uma vez cada
+    const allowed = ['const operationIdRef = useRef(null)', 'if (!operationIdRef.current) {', 'operationIdRef.current = newOperationId()',
+      'operation_id: operationIdRef.current', 'invalidateIntentOnChange(f, k, v, operationIdRef)']
+    for (const a of allowed) assert.equal(dialog.split(a).length - 1, 1, `${d.file}: uso aprovado ausente/duplicado: ${a}`)
+    assert.equal(src.split('operationIdRef').length - 1, allowed.length, `${d.file}: referência à chave fora dos usos aprovados (catch/finally/erro/load/render)`)
+    assert.equal((src.match(/newOperationId\(\)/g) || []).length, 1, `${d.file}: newOperationId chamado mais de uma vez`)
+    // A/B) edição da intenção passa SEMPRE pelo set(), que invalida ANTES de alterar o formulário
+    const iSet = dialog.indexOf('const set = (k, v) => {')
+    const setBlock = dialog.slice(iSet, dialog.indexOf('\n  }\n', iSet))
+    assert.ok(iSet > 0 && setBlock.indexOf('invalidateIntentOnChange(f, k, v, operationIdRef)') < setBlock.indexOf('setF('), `${d.file}: set não invalida antes de alterar`)
+    assert.equal((dialog.match(/setF\(/g) || []).length - (d.file.includes('agenda') ? 1 : 0), 1, `${d.file}: formulário alterado fora do set()`)
+    if (d.conflicts) {
+      assert.ok(setBlock.includes('if (invalidateIntentOnChange(f, k, v, operationIdRef)) setConflicts(null)'), `${d.file}: edição não limpa conflitos`)
+      assert.deepEqual((dialog.match(/setConflicts\([^)]*\)/g) || []).sort(), ['setConflicts(d.conflicts || [])', 'setConflicts(null)'], `${d.file}: conflitos limpos/definidos fora do fluxo`)
+      assert.ok(/\{conflicts \? \([\s\S]*?apply\(true\)[\s\S]*?\) : \([\s\S]*?apply\(false\)/.test(dialog), `${d.file}: sem conflitos não volta a apply(false)`)
+    }
+    // retry/rede: try/catch/finally; catch e finally não tocam a chave; chave gerada só se ausente
+    const body = fnBody(src, d.send)
+    const iTry = body.indexOf('try {\n')
     const iCatch = body.indexOf('} catch {', iTry)
     const iFinally = body.indexOf('} finally {', iCatch)
-    assert.ok(iTry > 0 && iCatch > iTry && iFinally > iCatch, `${file}: sem try/catch/finally em volta do fetch`)
-    assert.ok(body.slice(iTry, iCatch).includes('await fetch('), `${file}: fetch fora do try`)
-    const catchBlock = body.slice(iCatch, iFinally)
-    const finallyBlock = body.slice(iFinally)
-    assert.ok(!/operationIdRef\.current\s*=/.test(catchBlock), `${file}: catch altera/limpa a chave`)
-    assert.ok(!/newOperationId\(/.test(catchBlock), `${file}: catch gera outra chave`)
-    assert.ok(/toast\.error\('Não foi possível confirmar a resposta do servidor\. Tente novamente\.'\)/.test(catchBlock), `${file}: mensagem do catch`)
-    assert.ok(finallyBlock.includes('setBusy(false)'), `${file}: finally não libera busy`)
-    assert.equal((body.slice(0, iTry).match(/setBusy\(false\)/g) || []).length + (body.slice(iTry, iFinally).match(/setBusy\(false\)/g) || []).length, 0, `${file}: setBusy(false) fora do finally`)
-    // uma chave por intenção: gerada só se ainda não existe; nenhum outro ponto do arquivo a limpa
-    assert.equal((src.match(/newOperationId\(\)/g) || []).length, 1, `${file}: newOperationId chamado mais de uma vez`)
-    assert.ok(body.indexOf('if (!operationIdRef.current)') < body.indexOf('newOperationId()'), `${file}: chave não é gerada só uma vez`)
-    assert.equal((src.match(/operationIdRef\.current\s*=(?!=)/g) || []).length, 1, `${file}: a chave é atribuída/limpa em outro ponto`)
+    assert.ok(iTry > 0 && iCatch > iTry && iFinally > iCatch, `${d.file}: sem try/catch/finally em volta do fetch`)
+    assert.ok(body.slice(iTry, iCatch).includes('await fetch('), `${d.file}: fetch fora do try`)
+    for (const [label, block] of [['try/erro HTTP', body.slice(iTry, iCatch)], ['catch', body.slice(iCatch, iFinally)], ['finally', body.slice(iFinally)]])
+      assert.ok(!/operationIdRef|newOperationId|invalidateIntentOnChange/.test(block.replace('operation_id: operationIdRef.current', '')), `${d.file}: ${label} altera a chave`)
+    assert.ok(/toast\.error\('Não foi possível confirmar a resposta do servidor\. Tente novamente\.'\)/.test(body.slice(iCatch, iFinally)), `${d.file}: mensagem do catch`)
+    assert.ok(body.slice(iFinally).includes('setBusy(false)'), `${d.file}: finally não libera busy`)
+    assert.equal((body.slice(0, iFinally).match(/setBusy\(false\)/g) || []).length, 0, `${d.file}: setBusy(false) fora do finally`)
+    assert.ok(body.indexOf('if (!operationIdRef.current)') < body.indexOf('newOperationId()') && body.indexOf('newOperationId()') < iTry, `${d.file}: chave não é gerada só uma vez, antes do envio`)
+
+    // Modelo executável do fluxo (mesmas regras verificadas acima), com o helper real
+    const st = { key: { current: null }, conflicts: null, form: { start_time: '20:00' }, sent: [] }
+    let n = 0
+    const send = (outcome) => {
+      if (!st.key.current) st.key.current = `op-${++n}`
+      st.sent.push(st.key.current)
+      if (outcome === 'needs_decision' && d.conflicts) st.conflicts = [{ date: 'x' }]
+    }
+    const set = (k, v) => { if (invalidateIntentOnChange(st.form, k, v, st.key) && d.conflicts) st.conflicts = null; st.form = { ...st.form, [k]: v } }
+    send('network_error'); send('http_error'); send('needs_decision')
+    assert.deepEqual(st.sent, ['op-1', 'op-1', 'op-1'], `${d.file}: retry/rede/erro HTTP/needs_decision trocou a chave`)
+    set('start_time', '20:00')
+    assert.equal(st.key.current, 'op-1', `${d.file}: valor igual invalidou a intenção`)
+    if (d.conflicts) assert.equal(st.conflicts?.length, 1, 'valor igual limpou a decisão')
+    set('start_time', '21:00')
+    assert.equal(st.key.current, null, `${d.file}: edição real manteve a chave`)
+    if (d.conflicts) assert.equal(st.conflicts, null, 'edição manteve os conflitos da intenção anterior')
+    assert.equal(d.conflicts && st.conflicts ? 'apply(true)' : 'apply(false)', 'apply(false)')
+    send('ok'); send('network_error')
+    assert.deepEqual(st.sent.slice(3), ['op-2', 'op-2'], `${d.file}: nova intenção não recebeu chave nova/estável`)
   }
 })
 

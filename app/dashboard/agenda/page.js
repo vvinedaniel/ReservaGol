@@ -4,10 +4,13 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import { useMe } from '@/components/reserva/dashboard-shell'
 import { createClient } from '@/lib/supabase/browser'
 import { EmptyState } from '@/components/reserva/empty-state'
-import { STATUS_META, RESERVATION_STATUSES, SOURCES, BLOCK_REASONS, statusMeta } from '@/lib/reserva/status'
+import { STATUS_META, CREATE_STATUSES, EDIT_STATUSES, SOURCES, BLOCK_REASONS, statusMeta } from '@/lib/reserva/status'
+import { FinancePanel, PaymentStatusBadge, fetchPaymentSummaries, countPaidOccurrences } from '@/components/reserva/finance-panel'
+import { formatCents } from '@/lib/reserva/money'
 import { buildSlots, overlaps, fmtTime, fmtDateLong, fmtDateTimeLong, todayStr, addDaysStr, weekdayOf, timeToMin, closeTimeToMin } from '@/lib/reserva/time'
 import { isManagerOrAbove } from '@/lib/auth/permissions'
 import { newOperationId } from '@/lib/reserva/operation-id'
+import { invalidateIntentOnChange } from '@/lib/reserva/intent'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -84,6 +87,15 @@ export default function AgendaPage() {
     return () => { supabase.removeChannel(ch) }
   }, [orgId, supabase])
 
+  // 03A: status de pagamento por reserva (RPC de resumos; a recepção recebe só o status).
+  const [pay, setPay] = useState({})
+  useEffect(() => {
+    const ids = (data?.reservations || []).filter((r) => r.status !== 'BLOCKED').map((r) => r.id)
+    let alive = true
+    fetchPaymentSummaries(ids).then((m) => { if (alive) setPay(m) })
+    return () => { alive = false }
+  }, [data])
+
   const courts = data?.courts || []
   const hours = data?.business_hours
   const step = data?.default_reservation_minutes || 60
@@ -158,6 +170,7 @@ export default function AgendaPage() {
                             <button onClick={() => setDetail(res)} className={cn('w-full rounded-md border px-2 py-1.5 text-left text-xs transition-colors', m.cell)}>
                               <span className="flex items-center gap-1.5 font-medium"><span className={cn('h-1.5 w-1.5 rounded-full', m.dot)} />{m.label}{res.recurring_reservation_id && <Repeat className="h-3 w-3 opacity-80" />}</span>
                               <span className="mt-0.5 block truncate opacity-90">{res.status === 'BLOCKED' ? (res.notes || 'Bloqueio') : (res.customer?.name || 'Sem cliente')}</span>
+                              {pay[res.id] && <PaymentStatusBadge status={pay[res.id].payment_status} className="mt-1 px-1.5 py-0 text-[10px]" />}
                             </button>
                           ) : (
                             <button onClick={() => setDlg({ court_id: c.id, start: s.start, end: s.end })} className={cn('flex h-11 w-full items-center justify-center rounded-md border border-dashed border-transparent text-xs text-muted-foreground transition-colors', m.cell)}>
@@ -174,19 +187,19 @@ export default function AgendaPage() {
           </div>
 
           <div className="lg:hidden">
-            <MobileAgenda courts={courts} slots={slots} findRes={findRes} onNew={(courtId, s) => setDlg({ court_id: courtId, start: s.start, end: s.end })} onOpen={setDetail} />
+            <MobileAgenda courts={courts} slots={slots} findRes={findRes} pay={pay} onNew={(courtId, s) => setDlg({ court_id: courtId, start: s.start, end: s.end })} onOpen={setDetail} />
           </div>
         </>
       )}
 
       {dlg && <ReservationDialog open={!!dlg} onClose={() => setDlg(null)} orgId={orgId} arenaId={arenaId} date={date} courts={view === 'week' ? (week?.courts || courts) : courts} initial={dlg} onSaved={() => reloadRef.current()} />}
       {blockDlg && <BlockDialog open={!!blockDlg} onClose={() => setBlockDlg(null)} orgId={orgId} arenaId={arenaId} date={date} courts={view === 'week' ? (week?.courts || courts) : courts} initial={blockDlg} onSaved={() => reloadRef.current()} />}
-      {detail && <DetailSheet res={detail} canManageSeries={canManageSeries} courts={view === 'week' ? (week?.courts || courts) : courts} onClose={() => setDetail(null)} onChanged={() => reloadRef.current()} onEdit={(r) => { setDetail(null); setDlg({ edit: r, court_id: r.court_id, date: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date(r.start_at)), start: fmtTime(r.start_at), end: fmtTime(r.end_at) }) }} />}
+      {detail && <DetailSheet res={detail} role={me?.role} canManageSeries={canManageSeries} courts={view === 'week' ? (week?.courts || courts) : courts} onClose={() => setDetail(null)} onChanged={() => reloadRef.current()} onEdit={(r) => { setDetail(null); setDlg({ edit: r, court_id: r.court_id, date: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date(r.start_at)), start: fmtTime(r.start_at), end: fmtTime(r.end_at) }) }} />}
     </div>
   )
 }
 
-function MobileAgenda({ courts, slots, findRes, onNew, onOpen }) {
+function MobileAgenda({ courts, slots, findRes, pay = {}, onNew, onOpen }) {
   const [court, setCourt] = useState(courts[0]?.id)
   useEffect(() => { if (courts.length && !courts.find((c) => c.id === court)) setCourt(courts[0]?.id) }, [courts, court])
   const c = courts.find((x) => x.id === court) || courts[0]
@@ -208,6 +221,7 @@ function MobileAgenda({ courts, slots, findRes, onNew, onOpen }) {
                 <button onClick={() => onOpen(res)} className={cn('flex-1 rounded-lg border px-3 py-2.5 text-left text-sm', m.cell)}>
                   <span className="flex items-center gap-2 font-medium"><span className={cn('h-2 w-2 rounded-full', m.dot)} />{m.label}{res.recurring_reservation_id && <Repeat className="h-3 w-3 opacity-80" />}</span>
                   <span className="mt-0.5 block text-xs opacity-90">{res.status === 'BLOCKED' ? (res.notes || 'Bloqueio') : (res.customer?.name || 'Sem cliente')}</span>
+                  {pay[res.id] && <PaymentStatusBadge status={pay[res.id].payment_status} className="mt-1 px-1.5 py-0 text-[10px]" />}
                 </button>
               ) : (
                 <button onClick={() => onNew(c.id, s)} className="flex-1 rounded-lg border border-dashed border-border px-3 py-2.5 text-left text-sm text-muted-foreground">Livre — toque para reservar</button>
@@ -255,7 +269,10 @@ function ReservationDialog({ open, onClose, orgId, arenaId, date, courts, initia
     setSaving(false)
     if (res.status === 409) { toast.error('Horário indisponível', { description: 'Este horário acabou de ficar indisponível. Escolha outro horário.' }); onSaved(); return }
     if (!res.ok) { const e = await res.json().catch(() => ({})); toast.error('Não foi possível salvar', { description: e.error }); return }
-    toast.success(edit ? 'Reserva atualizada' : 'Reserva criada')
+    const saved = await res.json().catch(() => ({}))
+    // 03A FIX2: com lançamento financeiro ativo o banco preserva o valor ao mudar data/horário/quadra.
+    if (edit && saved.price_review_required) toast.warning('Reserva atualizada. O valor foi mantido porque existem lançamentos financeiros. Revise o valor da reserva.')
+    else toast.success(edit ? 'Reserva atualizada' : 'Reserva criada')
     onClose(); onSaved()
   }
 
@@ -298,7 +315,7 @@ function ReservationDialog({ open, onClose, orgId, arenaId, date, courts, initia
               <Label>Status</Label>
               <Select value={form.status} onValueChange={(v) => setForm((f) => ({ ...f, status: v }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>{RESERVATION_STATUSES.map((s) => <SelectItem key={s} value={s}>{STATUS_META[s].label}</SelectItem>)}</SelectContent>
+                <SelectContent>{(edit ? EDIT_STATUSES : CREATE_STATUSES).map((s) => <SelectItem key={s} value={s}>{STATUS_META[s].label}</SelectItem>)}</SelectContent>
               </Select>
             </div>
             <div className="space-y-1.5">
@@ -365,8 +382,9 @@ function BlockDialog({ open, onClose, orgId, arenaId, date, courts, initial, onS
   )
 }
 
-function DetailSheet({ res, courts, canManageSeries, onClose, onEdit, onChanged }) {
+function DetailSheet({ res, role, courts, canManageSeries, onClose, onEdit, onChanged }) {
   const m = statusMeta(res.status)
+  const [fin, setFin] = useState(null)
   const [cancelling, setCancelling] = useState(false)
   const [reason, setReason] = useState('')
   const [confirm, setConfirm] = useState(false)
@@ -397,6 +415,7 @@ function DetailSheet({ res, courts, canManageSeries, onClose, onEdit, onChanged 
           <Row icon={Pencil} label="Observações" value={res.notes} />
           <Row icon={Clock} label="Criada em" value={fmtDateTimeLong(res.created_at)} />
         </div>
+        {res.status !== 'BLOCKED' && <FinancePanel reservationId={res.id} role={role} onLoaded={setFin} onChanged={onChanged} />}
         {res.status !== 'CANCELLED' && (
           <div className="mt-5 space-y-3">
             {res.status !== 'BLOCKED' && !isRecurring && <Button variant="outline" className="w-full" onClick={() => onEdit(res)}><Pencil className="mr-2 h-4 w-4" /> Editar</Button>}
@@ -413,6 +432,9 @@ function DetailSheet({ res, courts, canManageSeries, onClose, onEdit, onChanged 
               <Button variant="destructive" className="w-full" onClick={() => setConfirm(true)}><X className="mr-2 h-4 w-4" /> {isRecurring ? 'Cancelar apenas esta data' : 'Cancelar reserva'}</Button>
             ) : (
               <div className="space-y-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
+                {fin?.net_received > 0 && (
+                  <p className="text-xs text-amber-500">Esta reserva tem {formatCents(fin.net_received)} recebidos. Cancelar não devolve o dinheiro: o valor fica retido até um gerente registrar o estorno.</p>
+                )}
                 <Label className="text-xs">Motivo (opcional)</Label>
                 <Input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Motivo do cancelamento" />
                 <div className="flex gap-2">
@@ -436,16 +458,25 @@ function RescheduleDialog({ res, courts, onClose, onDone }) {
   const [f, setF] = useState(null)
   const [busy, setBusy] = useState(false)
   const [conflicts, setConflicts] = useState(null)
+  const [paidAhead, setPaidAhead] = useState(0)
   // B3: uma chave por intenção de reagendamento; reutilizada em retry/needs_decision; some ao fechar.
   const operationIdRef = useRef(null)
   useEffect(() => {
     fetch(`/api/recurring-reservations/${res.recurring_reservation_id}`).then((r) => r.json()).then((s) => {
       setSeries(s)
+      // 03A: ocorrências a partir desta data que já têm pagamento (serão canceladas com valor retido).
+      const ahead = (s.upcoming || []).filter((o) => new Date(o.start_at).getTime() >= new Date(`${fromDate}T00:00:00-03:00`).getTime()).map((o) => o.id)
+      countPaidOccurrences(ahead).then(setPaidAhead)
       setF({ court_id: res.court_id, weekday: String(s.weekday ?? weekdayOf(fromDate)), day_of_month: String(s.day_of_month || 10), start_time: fmtTime(res.start_at), end_time: fmtTime(res.end_at) })
     }).catch(() => {})
   }, [])
   if (!f || !series) return null
-  const set = (k, v) => setF((s) => ({ ...s, [k]: v }))
+  // Editar quadra/dia/horário muda a intenção: descarta a chave E os conflitos da intenção anterior,
+  // para que a nova volte por apply(false) e receba uma decisão nova do servidor.
+  const set = (k, v) => {
+    if (invalidateIntentOnChange(f, k, v, operationIdRef)) setConflicts(null)
+    setF((s) => ({ ...s, [k]: v }))
+  }
   const payload = (extra) => ({ from_date: fromDate, court_id: f.court_id, start_time: f.start_time, end_time: f.end_time, weekday: series.frequency === 'MONTHLY' ? null : Number(f.weekday), day_of_month: series.frequency === 'MONTHLY' ? Number(f.day_of_month) : null, ...extra })
   async function apply(skip) {
     if (!operationIdRef.current) {
@@ -472,6 +503,7 @@ function RescheduleDialog({ res, courts, onClose, onDone }) {
       <DialogContent className="max-h-[90vh] overflow-y-auto">
         <DialogHeader><DialogTitle>Editar esta e as próximas</DialogTitle></DialogHeader>
         <p className="text-sm text-muted-foreground">As reservas anteriores a {fromDate} permanecem intactas. As futuras serão recalculadas com as novas informações.</p>
+        {paidAhead > 0 && <p className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-xs text-amber-500">{paidAhead} reserva(s) futura(s) desta série já têm pagamento. Elas serão canceladas e o valor ficará retido até ser estornado.</p>}
         <div className="mt-4 space-y-4">
           <div className="space-y-1.5"><Label>Quadra</Label>
             <Select value={f.court_id} onValueChange={(v) => set('court_id', v)}><SelectTrigger><SelectValue /></SelectTrigger>

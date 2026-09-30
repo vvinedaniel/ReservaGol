@@ -5,6 +5,9 @@ import { useMe } from '@/components/reserva/dashboard-shell'
 import { isManagerOrAbove } from '@/lib/auth/permissions'
 import { fmtDateTimeLong } from '@/lib/reserva/time'
 import { newOperationId } from '@/lib/reserva/operation-id'
+import { invalidateIntentOnChange } from '@/lib/reserva/intent'
+import { formatCents, parseMoneyToCents, centsToInput } from '@/lib/reserva/money'
+import { countPaidOccurrences } from '@/components/reserva/finance-panel'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -24,8 +27,20 @@ const FREQ_LABEL = { WEEKLY: 'Semanal', BIWEEKLY: 'Quinzenal', MONTHLY: 'Mensal'
 const STATUS_META = { ACTIVE: { l: 'Ativo', c: 'bg-primary/15 text-primary' }, PAUSED: { l: 'Pausado', c: 'bg-amber-500/15 text-amber-500' }, CANCELLED: { l: 'Cancelado', c: 'bg-muted text-muted-foreground' } }
 const TABS = [{ k: 'ACTIVE', l: 'Ativos' }, { k: 'PAUSED', l: 'Pausados' }, { k: 'CANCELLED', l: 'Cancelados' }]
 
-const centsToBRL = (c) => (c == null ? null : (c / 100).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }))
-const brlToCents = (v) => { const n = parseFloat(String(v).replace(/\./g, '').replace(',', '.')); return isNaN(n) ? null : Math.round(n * 100) }
+// 03A: dinheiro sempre em centavos inteiros, sem float (lib/reserva/money).
+const centsToBRL = (c) => (c == null ? null : formatCents(c))
+
+// Primeira data da série (>= início) para cotar o default_price pela tabela de preços.
+function firstSeriesDate(f) {
+  const start = new Date(`${f.start_date}T12:00:00-03:00`)
+  for (let i = 0; i < 62; i++) {
+    const d = new Date(start.getTime() + i * 86400000)
+    const ds = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(d)
+    const dow = new Date(`${ds}T12:00:00-03:00`).getUTCDay()
+    if (f.frequency === 'MONTHLY' ? Number(ds.slice(8, 10)) === Number(f.day_of_month) : dow === Number(f.weekday)) return ds
+  }
+  return null
+}
 
 export default function MensalistasPage() {
   const me = useMe()
@@ -155,20 +170,45 @@ function CreateDialog({ orgId, arena, courts, onClose, onCreated }) {
   const [f, setF] = useState({ court_id: courts[0]?.id || '', frequency: 'WEEKLY', weekday: '3', day_of_month: '10', start_time: '20:00', end_time: '21:00', start_date: todayStr, end_date: '', has_no_end_date: true, price: '', notes: '', name: '', phone: '' })
   const [preview, setPreview] = useState(null)
   const [busy, setBusy] = useState(false)
-  // B3: uma chave por intenção de criação; reutilizada em retry/needs_decision; some ao fechar.
+  // B3: uma chave por intenção de criação; reutilizada em retry/needs_decision sem edição; some ao
+  // fechar. Editar qualquer campo (inclusive "Usar tabela", que altera o preço) muda a intenção e
+  // descarta a chave: o próximo envio gera outra.
   const operationIdRef = useRef(null)
-  const set = (k, v) => setF((s) => ({ ...s, [k]: v }))
+  const set = (k, v) => {
+    invalidateIntentOnChange(f, k, v, operationIdRef)
+    setF((s) => ({ ...s, [k]: v }))
+  }
 
+  // Preço por jogo: vazio = sem valor; texto inválido = erro (nunca aproximado).
+  const priceCents = () => (f.price.trim() === '' ? null : parseMoneyToCents(f.price))
   const body = () => ({
     organization_id: orgId, arena_id: arena.id, court_id: f.court_id, frequency: f.frequency,
     weekday: f.frequency === 'MONTHLY' ? null : Number(f.weekday), day_of_month: f.frequency === 'MONTHLY' ? Number(f.day_of_month) : null,
     start_time: f.start_time, end_time: f.end_time, start_date: f.start_date,
     end_date: f.has_no_end_date ? null : (f.end_date || null), has_no_end_date: f.has_no_end_date,
-    default_price: brlToCents(f.price), notes: f.notes || null, customer: { name: f.name, phone: f.phone },
+    default_price: priceCents(), notes: f.notes || null, customer: { name: f.name, phone: f.phone },
   })
+
+  // 03A: sugere o default_price pela tabela de preços (continua editável — ex.: desconto do mensalista).
+  const [quoting, setQuoting] = useState(false)
+  async function quotePrice() {
+    const date = firstSeriesDate(f)
+    if (!f.court_id || !date) { toast.error('Informe quadra, dia e início da série'); return }
+    setQuoting(true)
+    try {
+      const p = new URLSearchParams({ court_id: f.court_id, date, start_time: f.start_time, end_time: f.end_time })
+      const r = await fetch(`/api/pricing/quote?${p.toString()}`)
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) { toast.error(d.error || 'Não foi possível consultar a tabela'); return }
+      if (d.price == null) { toast.error('Nenhuma regra de preço cobre esse horário por completo'); return }
+      set('price', centsToInput(d.price))
+      toast.success(`Tabela: ${formatCents(d.price)} por jogo`)
+    } catch { toast.error('Não foi possível consultar a tabela') } finally { setQuoting(false) }
+  }
 
   async function doPreview() {
     if (!f.name || !f.court_id) { toast.error('Informe o cliente e a quadra'); return }
+    if (f.price.trim() !== '' && priceCents() === null) { toast.error('Preço por jogo inválido', { description: 'Use o formato 180,00.' }); return }
     if (!f.has_no_end_date && !f.end_date) { toast.error('Informe a data final ou marque “sem data final”'); return }
     setBusy(true)
     const r = await fetch('/api/recurring-reservations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body(), dry_run: true }) })
@@ -237,7 +277,13 @@ function CreateDialog({ orgId, arena, courts, onClose, onCreated }) {
               <div className="space-y-1.5"><Label>Data final</Label><Input type="date" value={f.end_date} onChange={(e) => set('end_date', e.target.value)} disabled={f.has_no_end_date} /></div>
             </div>
             <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={f.has_no_end_date} onChange={(e) => set('has_no_end_date', e.target.checked)} className="h-4 w-4 accent-[var(--primary)]" /> Sem data final</label>
-            <div className="space-y-1.5"><Label>Preço por jogo (opcional)</Label><Input value={f.price} onChange={(e) => set('price', e.target.value)} placeholder="Ex.: 180,00" inputMode="decimal" /></div>
+            <div className="space-y-1.5"><Label>Preço por jogo (opcional)</Label>
+              <div className="flex gap-2">
+                <Input value={f.price} onChange={(e) => set('price', e.target.value)} placeholder="Ex.: 180,00" inputMode="decimal" />
+                <Button type="button" variant="outline" onClick={quotePrice} disabled={quoting}>{quoting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}Usar tabela</Button>
+              </div>
+              <p className="text-xs text-muted-foreground">Cada jogo gerado guarda este valor. Alterar depois não muda jogos já gerados.</p>
+            </div>
             <div className="space-y-1.5"><Label>Observação (opcional)</Label><Textarea rows={2} value={f.notes} onChange={(e) => set('notes', e.target.value)} /></div>
             <DialogFooter>
               <Button variant="outline" onClick={onClose}>Cancelar</Button>
@@ -249,7 +295,7 @@ function CreateDialog({ orgId, arena, courts, onClose, onCreated }) {
             <div className="rounded-xl border border-border bg-muted/30 p-4 text-sm">
               <p className="font-semibold">{f.name}</p>
               <p className="text-muted-foreground">{courts.find((c) => c.id === f.court_id)?.name} · {f.frequency === 'MONTHLY' ? `Dia ${f.day_of_month}` : WEEKDAYS[Number(f.weekday)]} · {f.start_time}–{f.end_time}</p>
-              <p className="text-muted-foreground">{FREQ_LABEL[f.frequency]} · a partir de {f.start_date} · {f.has_no_end_date ? 'sem data final' : `até ${f.end_date}`}{f.price ? ` · ${f.price} por jogo` : ''}</p>
+              <p className="text-muted-foreground">{FREQ_LABEL[f.frequency]} · a partir de {f.start_date} · {f.has_no_end_date ? 'sem data final' : `até ${f.end_date}`}{priceCents() != null ? ` · ${formatCents(priceCents())} por jogo` : ''}</p>
             </div>
             <div className="flex items-start gap-2 rounded-lg border border-primary/30 bg-primary/[0.06] p-3 text-sm">
               <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
@@ -283,10 +329,14 @@ function DetailSheet({ id, canManage, courts, onClose, onChanged }) {
   const [s, setS] = useState(null)
   const [busy, setBusy] = useState(false)
   const [confirm, setConfirm] = useState(null) // {type, ...}
+  const [paidAhead, setPaidAhead] = useState(0)
 
   const load = useCallback(async () => {
     const r = await fetch(`/api/recurring-reservations/${id}`)
-    setS(r.ok ? await r.json() : null)
+    const d = r.ok ? await r.json() : null
+    setS(d)
+    // 03A: próximas ocorrências com pagamento (ficariam canceladas com valor retido ao pausar/cancelar).
+    if (d) countPaidOccurrences((d.upcoming || []).map((o) => o.id)).then(setPaidAhead)
   }, [id])
   useEffect(() => { load() }, [load])
 
@@ -369,7 +419,7 @@ function DetailSheet({ id, canManage, courts, onClose, onChanged }) {
         <AlertDialog open onOpenChange={() => setConfirm(null)}>
           <AlertDialogContent>
             <AlertDialogHeader><AlertDialogTitle>Pausar mensalista</AlertDialogTitle>
-              <AlertDialogDescription>Enquanto pausada, nenhuma nova reserva será gerada. Deseja cancelar também as reservas futuras já geradas?</AlertDialogDescription>
+              <AlertDialogDescription>Enquanto pausada, nenhuma nova reserva será gerada. Deseja cancelar também as reservas futuras já geradas?{paidAhead > 0 ? ` Atenção: ${paidAhead} reserva(s) futura(s) já têm pagamento; se forem canceladas, o valor fica retido até ser estornado.` : ''}</AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter className="flex-col gap-2 sm:flex-row">
               <AlertDialogCancel>Voltar</AlertDialogCancel>
@@ -383,7 +433,7 @@ function DetailSheet({ id, canManage, courts, onClose, onChanged }) {
         <AlertDialog open onOpenChange={() => setConfirm(null)}>
           <AlertDialogContent>
             <AlertDialogHeader><AlertDialogTitle>Cancelar toda a recorrência?</AlertDialogTitle>
-              <AlertDialogDescription>As reservas futuras ainda não realizadas serão canceladas. O histórico passado é preservado.</AlertDialogDescription>
+              <AlertDialogDescription>As reservas futuras ainda não realizadas serão canceladas. O histórico passado é preservado.{paidAhead > 0 ? ` Atenção: ${paidAhead} reserva(s) futura(s) já têm pagamento; o valor fica retido até ser estornado.` : ''}</AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
               <AlertDialogCancel>Voltar</AlertDialogCancel>

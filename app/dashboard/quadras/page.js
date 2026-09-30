@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useMe } from '@/components/reserva/dashboard-shell'
 import { EmptyState } from '@/components/reserva/empty-state'
+import { PricingRulesSheet } from '@/components/reserva/pricing-rules-sheet'
 import { isManagerOrAbove } from '@/lib/auth/permissions'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -13,7 +14,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { LayoutGrid, Plus, Pencil, Loader2 } from 'lucide-react'
+import { LayoutGrid, Plus, Pencil, Loader2, BadgeDollarSign } from 'lucide-react'
 import { toast } from 'sonner'
 
 const COURT_TYPES = ['Society', 'Futsal', 'Campo', 'Beach', 'Outra']
@@ -28,6 +29,7 @@ export default function CourtsPage() {
   const [open, setOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const [editing, setEditing] = useState(null)
+  const [pricingOpen, setPricingOpen] = useState(false)
   const [form, setForm] = useState({ name: '', arena_id: '', type: 'Society', description: '', active: true })
 
   const load = useCallback(async () => {
@@ -87,7 +89,12 @@ export default function CourtsPage() {
           <h1 className="font-display text-2xl font-bold">Quadras</h1>
           <p className="mt-1 text-sm text-muted-foreground">Gerencie as quadras das suas unidades.</p>
         </div>
-        {canEdit && <Button onClick={openNew} disabled={!arenas.length}><Plus className="mr-2 h-4 w-4" /> Adicionar quadra</Button>}
+        {canEdit && (
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={() => setPricingOpen(true)} disabled={!arenas.length}><BadgeDollarSign className="mr-2 h-4 w-4" /> Tabela de preços</Button>
+            <Button onClick={openNew} disabled={!arenas.length}><Plus className="mr-2 h-4 w-4" /> Adicionar quadra</Button>
+          </div>
+        )}
       </div>
 
       {loading ? (
@@ -117,6 +124,8 @@ export default function CourtsPage() {
           ))}
         </div>
       )}
+
+      {canEdit && pricingOpen && <PricingRulesSheet open={pricingOpen} onClose={() => setPricingOpen(false)} arenas={arenas} courts={courts} />}
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
