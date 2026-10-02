@@ -1,5 +1,5 @@
 'use client'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { Logo } from '@/components/reserva/logo'
 import { Button } from '@/components/ui/button'
@@ -10,7 +10,8 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { MapPin, MessageCircle, Navigation, Goal, Loader2, CheckCircle2, Clock } from 'lucide-react'
 import { toast } from 'sonner'
-import { todayStr, addDaysStr, weekdayOf, fmtDateLong, minsOfDay, isWithinHours } from '@/lib/reserva/time'
+import { todayStr, addDaysStr, weekdayOf, fmtDateLong, minsOfDay, isWithinHours, isValidDateStr, applyDateInput } from '@/lib/reserva/time'
+import { createRequestSequence, runLatest } from '@/lib/reserva/latest-request'
 import { publicMaxDate, cleanName, cleanBrPhone, cleanEmail, PUBLIC_ERRORS } from '@/lib/reserva/public-booking'
 
 export default function ArenaPublicPage() {
@@ -19,7 +20,9 @@ export default function ArenaPublicPage() {
   const [arena, setArena] = useState(null)
   const [notFound, setNotFound] = useState(false)
   const [courtId, setCourtId] = useState('')
+  // date = última data válida; dateInput = o que está no <input type="date">.
   const [date, setDate] = useState(todayStr())
+  const [dateInput, setDateInput] = useState(date)
   const [avail, setAvail] = useState(null)
   const [pick, setPick] = useState(null)
 
@@ -27,8 +30,32 @@ export default function ArenaPublicPage() {
     fetch(`/api/public/arena/${slug}`).then((r) => r.ok ? r.json() : Promise.reject()).then((d) => { setArena(d); setCourtId(d.courts?.[0]?.id || '') }).catch(() => setNotFound(true))
   }, [slug])
 
-  const loadAvail = () => { if (slug && courtId && date) fetch(`/api/public/availability?slug=${slug}&court_id=${courtId}&date=${date}`).then(async (r) => { const d = await r.json().catch(() => ({})); setAvail(r.ok ? d : { error: d.error || 'Não foi possível carregar os horários.' }) }).catch(() => setAvail({ error: 'Não foi possível carregar os horários.' })) }
-  useEffect(() => { setAvail(null); loadAvail(); const iv = setInterval(loadAvail, 10000); return () => clearInterval(iv) }, [slug, courtId, date])
+  // Troca de data e polling disputam a mesma sequência: resposta antiga nunca sobrescreve a atual.
+  const availSeq = useRef(createRequestSequence())
+  // Mudança de intenção invalida na hora; mesmo valor ou data inválida não invalidam.
+  const changeDate = (d) => {
+    if (!isValidDateStr(d) || d === date) return
+    availSeq.current.invalidate()
+    setDate(d)
+  }
+  const changeCourt = (id) => {
+    if (!id || id === courtId) return
+    availSeq.current.invalidate()
+    setCourtId(id)
+  }
+  const loadAvail = () => {
+    if (!slug || !courtId || !isValidDateStr(date)) return
+    runLatest(availSeq.current, async () => {
+      const r = await fetch(`/api/public/availability?slug=${slug}&court_id=${courtId}&date=${date}`)
+      const d = await r.json().catch(() => ({}))
+      return r.ok ? d : { error: d.error || 'Não foi possível carregar os horários.' }
+    }, {
+      onResult: setAvail,
+      onError: () => setAvail({ error: 'Não foi possível carregar os horários.' }),
+    })
+  }
+  // Cleanup (troca de slug/quadra/data ou unmount): para o polling e descarta o que está em andamento.
+  useEffect(() => { setAvail(null); loadAvail(); const iv = setInterval(loadAvail, 10000); return () => { clearInterval(iv); availSeq.current.invalidate() } }, [slug, courtId, date])
 
   const openNow = useMemo(() => {
     if (!arena?.business_hours) return null
@@ -61,8 +88,10 @@ export default function ArenaPublicPage() {
         <div className="mt-8 rounded-xl border border-border bg-card p-4">
           <h2 className="font-display text-lg font-semibold">Ver horários</h2>
           <div className="mt-3 grid grid-cols-2 gap-3">
-            <div><Label className="text-xs">Quadra</Label><Select value={courtId} onValueChange={setCourtId}><SelectTrigger className="mt-1"><SelectValue placeholder="Quadra" /></SelectTrigger><SelectContent>{arena.courts.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}</SelectContent></Select></div>
-            <div><Label className="text-xs">Data</Label><Input type="date" value={date} min={todayStr()} max={publicMaxDate(todayStr())} onChange={(e) => setDate(e.target.value)} className="mt-1" /></div>
+            <div><Label className="text-xs">Quadra</Label><Select value={courtId} onValueChange={changeCourt}><SelectTrigger className="mt-1"><SelectValue placeholder="Quadra" /></SelectTrigger><SelectContent>{arena.courts.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}</SelectContent></Select></div>
+            <div><Label className="text-xs">Data</Label><Input type="date" value={dateInput} min={todayStr()} max={publicMaxDate(todayStr())} className="mt-1"
+              onChange={(e) => { const next = applyDateInput(date, e.target.value); setDateInput(next.dateInput); changeDate(next.date) }}
+              onBlur={() => setDateInput(date)} /></div>
           </div>
           <p className="mt-3 text-xs capitalize text-muted-foreground">{fmtDateLong(date)}</p>
           <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">

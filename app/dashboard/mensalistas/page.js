@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { useMe } from '@/components/reserva/dashboard-shell'
 import { isManagerOrAbove } from '@/lib/auth/permissions'
-import { fmtDateTimeLong } from '@/lib/reserva/time'
+import { fmtDateTimeLong, isValidDateStr, firstSeriesDate } from '@/lib/reserva/time'
 import { newOperationId } from '@/lib/reserva/operation-id'
 import { invalidateIntentOnChange } from '@/lib/reserva/intent'
 import { formatCents, parseMoneyToCents, centsToInput } from '@/lib/reserva/money'
@@ -29,18 +29,6 @@ const TABS = [{ k: 'ACTIVE', l: 'Ativos' }, { k: 'PAUSED', l: 'Pausados' }, { k:
 
 // 03A: dinheiro sempre em centavos inteiros, sem float (lib/reserva/money).
 const centsToBRL = (c) => (c == null ? null : formatCents(c))
-
-// Primeira data da série (>= início) para cotar o default_price pela tabela de preços.
-function firstSeriesDate(f) {
-  const start = new Date(`${f.start_date}T12:00:00-03:00`)
-  for (let i = 0; i < 62; i++) {
-    const d = new Date(start.getTime() + i * 86400000)
-    const ds = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(d)
-    const dow = new Date(`${ds}T12:00:00-03:00`).getUTCDay()
-    if (f.frequency === 'MONTHLY' ? Number(ds.slice(8, 10)) === Number(f.day_of_month) : dow === Number(f.weekday)) return ds
-  }
-  return null
-}
 
 export default function MensalistasPage() {
   const me = useMe()
@@ -192,6 +180,7 @@ function CreateDialog({ orgId, arena, courts, onClose, onCreated }) {
   // 03A: sugere o default_price pela tabela de preços (continua editável — ex.: desconto do mensalista).
   const [quoting, setQuoting] = useState(false)
   async function quotePrice() {
+    if (!isValidDateStr(f.start_date)) { toast.error('Informe uma data de início válida'); return }
     const date = firstSeriesDate(f)
     if (!f.court_id || !date) { toast.error('Informe quadra, dia e início da série'); return }
     setQuoting(true)
