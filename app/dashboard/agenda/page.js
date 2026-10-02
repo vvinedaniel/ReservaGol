@@ -7,7 +7,8 @@ import { EmptyState } from '@/components/reserva/empty-state'
 import { STATUS_META, CREATE_STATUSES, EDIT_STATUSES, SOURCES, BLOCK_REASONS, statusMeta } from '@/lib/reserva/status'
 import { FinancePanel, PaymentStatusBadge, fetchPaymentSummaries, countPaidOccurrences } from '@/components/reserva/finance-panel'
 import { formatCents } from '@/lib/reserva/money'
-import { buildSlots, overlaps, fmtTime, fmtDateLong, fmtDateTimeLong, todayStr, addDaysStr, weekdayOf, timeToMin, closeTimeToMin } from '@/lib/reserva/time'
+import { buildSlots, overlaps, fmtTime, fmtDateLong, fmtDateTimeLong, todayStr, addDaysStr, weekdayOf, timeToMin, closeTimeToMin, isValidDateStr, applyDateInput } from '@/lib/reserva/time'
+import { createRequestSequence, runLatest } from '@/lib/reserva/latest-request'
 import { isManagerOrAbove } from '@/lib/auth/permissions'
 import { newOperationId } from '@/lib/reserva/operation-id'
 import { invalidateIntentOnChange } from '@/lib/reserva/intent'
@@ -31,7 +32,29 @@ export default function AgendaPage() {
   const supabase = createClient()
   const [arenas, setArenas] = useState([])
   const [arenaId, setArenaId] = useState('')
+  // date = última data válida usada pela Agenda; dateInput = o que está no <input type="date">.
   const [date, setDate] = useState(todayStr())
+  const [dateInput, setDateInput] = useState(date)
+  useEffect(() => { setDateInput(date) }, [date])
+
+  // Última navegação vence: DIA e SEMANA têm sequências independentes (Realtime entra nelas).
+  const daySeq = useRef(createRequestSequence())
+  const weekSeq = useRef(createRequestSequence())
+  const invalidateLoads = () => { daySeq.current.invalidate(); weekSeq.current.invalidate() }
+  useEffect(() => () => invalidateLoads(), []) // unmount: resposta/erro tardio não toca estado nem mostra toast
+
+  // Mudança de intenção invalida na hora (antes do effect da nova busca). Mesmo valor ou
+  // data inválida não invalidam: a requisição em andamento continua e encerra o loading.
+  const changeDate = (d) => {
+    if (!isValidDateStr(d) || d === date) return
+    invalidateLoads()
+    setDate(d)
+  }
+  const changeArena = (id) => {
+    if (!id || id === arenaId) return
+    invalidateLoads()
+    setArenaId(id)
+  }
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [dlg, setDlg] = useState(null)
@@ -52,28 +75,35 @@ export default function AgendaPage() {
     })
   }, [orgId])
 
-  const load = useCallback(async () => {
-    if (!arenaId || !date) return
-    setLoading(true)
-    const r = await fetch(`/api/agenda?arena_id=${arenaId}&date=${date}`)
-    const d = await r.json()
-    setData(r.ok ? d : null)
-    setLoading(false)
+  const load = useCallback(() => {
+    if (!arenaId || !isValidDateStr(date)) return
+    return runLatest(daySeq.current, async () => {
+      const r = await fetch(`/api/agenda?arena_id=${arenaId}&date=${date}`)
+      const d = await r.json().catch(() => null)
+      return r.ok ? d : null
+    }, {
+      onStart: () => setLoading(true),
+      onResult: setData,
+      onError: () => { setData(null); toast.error('Não foi possível carregar a agenda') },
+      onSettled: () => setLoading(false),
+    })
   }, [arenaId, date])
   loadRef.current = load
   useEffect(() => { load() }, [load])
 
   const mondayOf = (dateStr) => { const wd = weekdayOf(dateStr); return addDaysStr(dateStr, wd === 0 ? -6 : 1 - wd) }
-  const loadWeek = useCallback(async () => {
-    if (!arenaId || !date) return
-    setWeekLoading(true)
+  const loadWeek = useCallback(() => {
+    if (!arenaId || !isValidDateStr(date)) return
     const start = mondayOf(date)
     const dates = Array.from({ length: 7 }, (_, i) => addDaysStr(start, i))
-    const results = await Promise.all(dates.map((d) =>
+    return runLatest(weekSeq.current, () => Promise.all(dates.map((d) =>
       fetch(`/api/agenda?arena_id=${arenaId}&date=${d}`).then((r) => (r.ok ? r.json() : null)).then((j) => (j ? { ...j, date: d } : { date: d, courts: [], business_hours: null, reservations: [] }))
-    ))
-    setWeek({ start, days: results, step: results.find((r) => r.default_reservation_minutes)?.default_reservation_minutes || 60, courts: results.find((r) => r.courts?.length)?.courts || [] })
-    setWeekLoading(false)
+    )), {
+      onStart: () => setWeekLoading(true),
+      onResult: (results) => setWeek({ start, days: results, step: results.find((r) => r.default_reservation_minutes)?.default_reservation_minutes || 60, courts: results.find((r) => r.courts?.length)?.courts || [] }),
+      onError: () => { setWeek(null); toast.error('Não foi possível carregar a semana') },
+      onSettled: () => setWeekLoading(false),
+    })
   }, [arenaId, date])
   useEffect(() => { if (view === 'week') loadWeek() }, [view, loadWeek])
   reloadRef.current = () => { if (view === 'week') loadWeek(); else load() }
@@ -116,17 +146,19 @@ export default function AgendaPage() {
             <button onClick={() => setView('week')} className={cn('rounded-md px-3 py-1.5 text-sm font-medium transition-colors', view === 'week' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground')}>Semana</button>
           </div>
           {arenas.length > 1 && (
-            <Select value={arenaId} onValueChange={setArenaId}>
+            <Select value={arenaId} onValueChange={changeArena}>
               <SelectTrigger className="w-44"><SelectValue /></SelectTrigger>
               <SelectContent>{arenas.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}</SelectContent>
             </Select>
           )}
           <div className="flex items-center rounded-lg border border-border">
-            <Button variant="ghost" size="icon" onClick={() => setDate(addDaysStr(date, -1))}><ChevronLeft className="h-4 w-4" /></Button>
-            <Button variant="ghost" size="sm" onClick={() => setDate(todayStr())}>Hoje</Button>
-            <Button variant="ghost" size="icon" onClick={() => setDate(addDaysStr(date, 1))}><ChevronRight className="h-4 w-4" /></Button>
+            <Button variant="ghost" size="icon" onClick={() => changeDate(addDaysStr(date, -1))}><ChevronLeft className="h-4 w-4" /></Button>
+            <Button variant="ghost" size="sm" onClick={() => changeDate(todayStr())}>Hoje</Button>
+            <Button variant="ghost" size="icon" onClick={() => changeDate(addDaysStr(date, 1))}><ChevronRight className="h-4 w-4" /></Button>
           </div>
-          <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="w-40" />
+          <Input type="date" value={dateInput} className="w-40"
+            onChange={(e) => { const next = applyDateInput(date, e.target.value); setDateInput(next.dateInput); changeDate(next.date) }}
+            onBlur={() => setDateInput(date)} />
           <Button variant="outline" onClick={() => setBlockDlg({ court_id: courts[0]?.id || '', start: slots[0]?.start || '18:00', end: slots[0]?.end || '19:00' })} disabled={!courts.length}>
             <Ban className="mr-2 h-4 w-4" /> Bloquear horário
           </Button>
