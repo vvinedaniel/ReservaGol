@@ -8,6 +8,7 @@ import { insertWithPublicCode } from '@/lib/reserva/public-code'
 import { PUBLIC_ERRORS, isUuid, isValidSlug, isHHMM, isRealDate, checkPublicDate, safeSlotMinutes, publicSlots, findSlot, slotStarted, cleanName, cleanBrPhone, cleanEmail, cleanIdempotencyKey } from '@/lib/reserva/public-booking'
 import { CREATE_STATUSES, EDIT_STATUSES } from '@/lib/reserva/status'
 import { PAYMENT_METHODS, PRICE_REASONS, normalizeFinanceNotes, NOTES_MAX_CHARS } from '@/lib/reserva/finance'
+import { runFinanceEndpoint } from '@/lib/reserva/finance-api'
 
 // B1: sem headers CORS — a API só é consumida pelo próprio frontend (mesma origem).
 function json(data, status = 200) {
@@ -377,6 +378,7 @@ async function handleRoute(request, { params }) {
 
   try {
     if (resource === 'public') return await handlePublic(request, id, sub, method)
+    if (resource === 'finance') return await handleFinance(request, id, sub, method)
     const { supabase, user } = await getContext(request)
     if (!user) return json({ error: 'Não autenticado' }, 401)
     const url = new URL(request.url)
@@ -1287,6 +1289,23 @@ export const POST = handleRoute
 export const PUT = handleRoute
 export const PATCH = handleRoute
 export const DELETE = handleRoute
+
+// ============================ FASE 03B.1: FINANCEIRO (leitura) ============================
+// GET /api/finance/{overview|receivables|cashflow|cash-entries}: camada fina sobre as RPCs rg_fin_*.
+// Sempre com o client da SESSÃO do usuário (nunca service-role): o banco decide quem vê (OWNER/MANAGER)
+// e a que organização/arena o pedido pertence. Toda resposta (inclusive erro) é no-store.
+async function handleFinance(request, endpoint, extra, method) {
+  if (method !== 'GET' || extra !== undefined || !endpoint) return jsonNoStore({ error: 'Rota não encontrada' }, 404)
+  try {
+    const { supabase, user } = await getContext(request)
+    const { searchParams } = new URL(request.url)
+    const r = await runFinanceEndpoint({ endpoint, searchParams, user, callRpc: (name, args) => supabase.rpc(name, args) })
+    return jsonNoStore(r.body, r.status)
+  } catch (error) {
+    console.error('API financeiro: exceção')
+    return jsonNoStore({ error: 'Erro interno do servidor' }, 500)
+  }
+}
 
 // ============================ PHASE 02B: PUBLIC API ============================
 // Resposta pública que nunca deve ser guardada em cache (navegador, proxy ou CDN).
