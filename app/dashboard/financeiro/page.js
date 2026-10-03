@@ -23,7 +23,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import {
   Wallet, CircleDollarSign, Receipt, CalendarCheck, Clock, AlertTriangle, ShieldAlert, ArrowUpRight, ArrowDownRight,
   Minus, Loader2, Inbox, RefreshCw, BarChart3, Info, Gift,
@@ -338,7 +338,7 @@ function ReservationFinanceSheet({ item, role, onClose, onChanged }) {
   return (
     <Sheet open onOpenChange={(o) => { if (!o) onClose() }}>
       <SheetContent className="w-full overflow-y-auto sm:max-w-md">
-        <SheetHeader><SheetTitle>Reserva</SheetTitle></SheetHeader>
+        <SheetHeader><SheetTitle>Reserva</SheetTitle><SheetDescription className="sr-only">Dados e situação financeira da reserva selecionada.</SheetDescription></SheetHeader>
         <div className="mt-4 divide-y divide-border">
           <Row label="Cliente" value={item.customer_name} />
           <Row label="Telefone" value={item.customer_phone} />

@@ -231,6 +231,37 @@ await check('A06 endpoint desconhecido => 404 (inclusive nomes de protótipo)', 
   assert.deepEqual(Object.keys(FINANCE_ENDPOINTS), ['overview', 'receivables', 'cashflow', 'cash-entries'])
 })
 
+await check('A07 limites por endpoint = contrato das RPCs (cashflow por granularidade; demais 366 dias)', () => {
+  const cf = (from, to, granularity) => parseFinanceQuery('cashflow', sp({ organization_id: ORG, from, to, granularity }))
+  // day: 366 dias
+  assert.equal(cf('2027-01-01', '2028-01-01', 'day').ok, true, 'day 366')
+  assert.equal(cf('2027-01-01', '2028-01-02', 'day').status, 400, 'day 367')
+  assert.equal(parseFinanceQuery('cashflow', sp({ organization_id: ORG, from: '2027-01-01', to: '2028-01-02' })).status, 400, 'padrão day 367')
+  // month: 60 meses-calendário inclusivos (dia do mês não importa)
+  assert.equal(cf('2026-01-01', '2030-12-31', 'month').ok, true, 'month 60 (jan/2026..dez/2030)')
+  assert.equal(cf('2026-01-31', '2030-12-01', 'month').ok, true, 'month 60 com dias parciais')
+  assert.equal(cf('2026-01-01', '2031-01-01', 'month').status, 400, 'month 61')
+  assert.equal(cf('2025-12-31', '2030-12-01', 'month').status, 400, 'month 61 com dias parciais')
+  // year: 10 anos-calendário inclusivos
+  assert.equal(cf('2026-01-01', '2035-12-31', 'year').ok, true, 'year 10 (2026..2035)')
+  assert.equal(cf('2026-12-31', '2035-01-01', 'year').ok, true, 'year 10 com dias parciais')
+  assert.equal(cf('2026-01-01', '2036-01-01', 'year').status, 400, 'year 11')
+  assert.equal(cf('2025-12-31', '2035-01-01', 'year').status, 400, 'year 11 com dias parciais')
+  // granularidade validada antes do limite; datas fora de 2000–2100 continuam inválidas
+  assert.equal(cf('2026-01-01', '2030-12-31', 'week').error, 'Granularidade inválida.')
+  assert.equal(cf('2026-01-01', '2026-01-01', 'year').args.p_granularity, 'year')
+  assert.equal(cf('1999-01-01', '2001-12-31', 'year').status, 400)
+  // demais endpoints: 366 aceito, 367 rejeitado
+  for (const e of ['overview', 'receivables', 'cash-entries']) {
+    assert.equal(parseFinanceQuery(e, sp({ organization_id: ORG, from: '2027-01-01', to: '2028-01-01' })).ok, true, `${e} 366`)
+    const r = parseFinanceQuery(e, sp({ organization_id: ORG, from: '2027-01-01', to: '2028-01-02' }))
+    assert.equal(r.status, 400, `${e} 367`); assert.equal(r.error, 'Período acima do limite de 366 dias.')
+  }
+  // a UI continua limitada a 366 dias no personalizado
+  assert.equal(MAX_PERIOD_DAYS, 366)
+  assert.equal(isValidCustomPeriod('2027-01-01', '2028-01-02'), false)
+})
+
 // ------------------------------------------------------------------ API: execução e erros
 const fakeRpc = (impl) => { const calls = []; return { calls, fn: async (name, args) => { calls.push([name, args]); return impl(name, args) } } }
 const silent = () => {}
@@ -425,6 +456,13 @@ await check('U07 mobile 390 px: totais do Caixa nunca truncados; rótulos do gr�
   const chart = /function CashChart\([^)]*\) \{([\s\S]*?)\n\}/.exec(PAGE)[1]
   assert.ok(chart.includes("'absolute top-0 whitespace-nowrap'"), 'rótulos posicionados de forma absoluta')
   assert.ok(!/flex-1 truncate text-center/.test(chart), 'rótulos não ficam na largura da coluna')
+})
+
+await check('U08 painel da reserva com SheetDescription (sem warning Radix de descrição ausente)', () => {
+  assert.ok(PAGE.includes("import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'"))
+  const sheet = /function ReservationFinanceSheet[\s\S]*?\n\}\n/.exec(PAGE)[0]
+  assert.ok(/<SheetHeader><SheetTitle>Reserva<\/SheetTitle><SheetDescription className="sr-only">[^<]+<\/SheetDescription><\/SheetHeader>/.test(sheet))
+  assert.ok(read('components/ui/sheet.jsx').includes('SheetDescription,'), 'componente existente do projeto')
 })
 
 // ------------------------------------------------------------------ corridas (runLatest)
