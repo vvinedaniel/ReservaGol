@@ -417,6 +417,16 @@ await check('U06 seletor: atalhos, arena só com mais de uma, URL ?preset / ?fro
   assert.ok(PAGE.includes('isUuid(arenaParam) && arenas.list.some((a) => a.id === arenaParam)'), 'arena da URL validada contra a lista da organização')
 })
 
+await check('U07 mobile 390 px: totais do Caixa nunca truncados; rótulos do gráfico fora da coluna estreita', () => {
+  const total = /function Total\([^)]*\) \{([\s\S]*?)\n\}/.exec(PAGE)[1]
+  assert.ok(!total.includes('truncate'), 'valor do total não pode ser truncado')
+  assert.ok(total.includes('whitespace-nowrap') && total.includes('sm:block'))
+  assert.ok(PAGE.includes('<div className="grid gap-2 sm:grid-cols-3 sm:gap-4">'), 'totais empilhados no mobile')
+  const chart = /function CashChart\([^)]*\) \{([\s\S]*?)\n\}/.exec(PAGE)[1]
+  assert.ok(chart.includes("'absolute top-0 whitespace-nowrap'"), 'rótulos posicionados de forma absoluta')
+  assert.ok(!/flex-1 truncate text-center/.test(chart), 'rótulos não ficam na largura da coluna')
+})
+
 // ------------------------------------------------------------------ corridas (runLatest)
 await check('K01 toda carga financeira passa por runLatest; invalidação síncrona e no unmount', () => {
   const total = (PAGE.match(/fetchFinance\(/g) || []).length

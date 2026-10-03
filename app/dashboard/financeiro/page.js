@@ -307,7 +307,7 @@ function ReceivablesTab({ seqMain, seqMore, base, baseKey, filter, onFilterChang
                 className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-accent/40 focus-visible:bg-accent/40 focus-visible:outline-none">
                 <div className="min-w-0">
                   <p className="truncate text-sm font-medium">{it.customer_name || 'Sem cliente'}</p>
-                  <p className="truncate text-xs text-muted-foreground">{fmtDayShort(it.start_at)} · {fmtTime(it.start_at)}–{fmtTime(it.end_at)} · {it.court_name || 'Quadra'}</p>
+                  <p className="text-xs text-muted-foreground">{fmtDayShort(it.start_at)} · {fmtTime(it.start_at)}–{fmtTime(it.end_at)} · {it.court_name || 'Quadra'}</p>
                 </div>
                 <div className="flex shrink-0 flex-col items-end gap-1">
                   <span className="text-sm font-semibold">{it.balance == null ? 'Sem valor' : formatCents(it.balance)}</span>
@@ -405,7 +405,7 @@ function CashTab({ seqFlow, seqEntries, seqMore, base, baseKey, period, onForbid
         <CardContent className="space-y-5">
           {flow.loading || !flow.data ? <Skeleton className="h-48 w-full" /> : (
             <>
-              <div className="grid grid-cols-3 gap-2 sm:gap-4">
+              <div className="grid gap-2 sm:grid-cols-3 sm:gap-4">
                 <Total label="Pagamentos" value={formatCents(t?.in_gross)} />
                 <Total label="Estornos" value={t?.refunds > 0 ? `-${formatCents(t.refunds)}` : formatCents(0)} negative={t?.refunds > 0} />
                 <Total label="Líquido" value={formatCents(t?.in_net)} strong />
@@ -429,7 +429,7 @@ function CashTab({ seqFlow, seqEntries, seqMore, base, baseKey, period, onForbid
                       <div key={e.payment_id} className="flex items-center justify-between gap-3 px-4 py-3">
                         <div className="min-w-0">
                           <p className="truncate text-sm font-medium">{refund ? 'Estorno' : 'Pagamento'} · {PAYMENT_METHOD_LABELS[e.method] || e.method}</p>
-                          <p className="truncate text-xs text-muted-foreground">{fmtDateTimeLong(e.received_at)} · {e.customer_name || 'Sem cliente'}{e.court_name ? ` · ${e.court_name}` : ''}</p>
+                          <p className="text-xs text-muted-foreground">{fmtDateTimeLong(e.received_at)} · {e.customer_name || 'Sem cliente'}{e.court_name ? ` · ${e.court_name}` : ''}</p>
                         </div>
                         <span className={cn('shrink-0 text-sm font-semibold', refund ? 'text-red-400' : 'text-primary')}>{refund ? '-' : '+'}{formatCents(e.amount)}</span>
                       </div>
@@ -451,9 +451,10 @@ function CashTab({ seqFlow, seqEntries, seqMore, base, baseKey, period, onForbid
 
 function Total({ label, value, negative, strong }) {
   return (
-    <div className="rounded-lg border border-border bg-muted/20 px-3 py-2">
-      <p className="text-[11px] text-muted-foreground sm:text-xs">{label}</p>
-      <p className={cn('truncate text-sm sm:text-base', strong ? 'font-bold' : 'font-semibold', negative && 'text-red-400')}>{value}</p>
+    // Mobile: rótulo | valor na mesma linha (valor nunca truncado); a partir de sm: empilhado em 3 colunas.
+    <div className="flex items-baseline justify-between gap-3 rounded-lg border border-border bg-muted/20 px-3 py-2 sm:block">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className={cn('whitespace-nowrap text-sm sm:text-base', strong ? 'font-bold' : 'font-semibold', negative && 'text-red-400')}>{value}</p>
     </div>
   )
 }
@@ -475,8 +476,12 @@ function CashChart({ buckets, granularity }) {
           </div>
         ))}
       </div>
-      <div className="mt-1 flex gap-[2px] sm:gap-1">
-        {buckets.map((b, i) => <span key={b.bucket} className="min-w-0 flex-1 truncate text-center text-[10px] text-muted-foreground">{i % step === 0 ? bucketLabel(b.bucket, granularity) : ''}</span>)}
+      {/* Rótulos posicionados no centro da barra (não na largura da coluna, que no mobile tem poucos px). */}
+      <div className="relative mt-1 h-4 text-[10px] text-muted-foreground" aria-hidden="true">
+        {buckets.map((b, i) => (i % step === 0 ? (
+          <span key={b.bucket} className={cn('absolute top-0 whitespace-nowrap', i === 0 ? 'translate-x-0' : i === buckets.length - 1 ? '-translate-x-full' : '-translate-x-1/2')}
+            style={{ left: i === 0 ? 0 : `${((i * 2 + 1) * 50) / buckets.length}%` }}>{bucketLabel(b.bucket, granularity)}</span>
+        ) : null))}
       </div>
       <div className="mt-2 flex flex-wrap gap-4 text-xs text-muted-foreground">
         <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm bg-primary/80" /> Pagamentos</span>
