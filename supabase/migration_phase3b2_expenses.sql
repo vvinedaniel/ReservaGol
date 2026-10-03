@@ -1448,7 +1448,9 @@ begin
 end $$;
 
 -- Movimentos de caixa das duas fontes, ordem total DESC por (occurred_at, source_kind, id).
--- source_kind: 1 = reserva (entradas), 2 = despesa (saídas). signed_amount = efeito no resultado de caixa.
+-- source/source_kind = domínio de origem: 1 = reserva, 2 = despesa. direction = direção REAL do dinheiro
+-- (IN: recebimento de reserva, devolução de despesa; OUT: estorno de reserva, pagamento de despesa).
+-- signed_amount = efeito no resultado de caixa; invariante: direction = 'IN' sse signed_amount > 0.
 create function public.rg_fin_cash_movements(p_org uuid, p_arena uuid, p_from date, p_to date, p_limit integer,
                                              p_after_at timestamptz, p_after_source smallint, p_after_id uuid)
 returns jsonb language plpgsql stable security definer set search_path = '' set timezone = 'UTC' as $$
@@ -1473,6 +1475,8 @@ begin
   with r as (
     select p.received_at as at_, 1::smallint as src, p.id, p.kind, p.method, p.amount,
            case when p.kind = 'PAYMENT' then p.amount else -p.amount end::bigint as signed_amount,
+           -- direção real do dinheiro: recebimento entra; estorno ao cliente sai
+           case when p.kind = 'PAYMENT' then 'IN' else 'OUT' end as direction,
            p.reservation_id, null::uuid as expense_id
       from public.reservation_payments p
      where p.organization_id = p_org and (p_arena is null or p.arena_id = p_arena)
@@ -1483,6 +1487,8 @@ begin
   ), x as (
     select ep.paid_at as at_, 2::smallint as src, ep.id, ep.kind, ep.method, ep.amount,
            case when ep.kind = 'PAYMENT' then -ep.amount else ep.amount end::bigint as signed_amount,
+           -- direção real do dinheiro: pagamento ao fornecedor sai; devolução do fornecedor entra
+           case when ep.kind = 'PAYMENT' then 'OUT' else 'IN' end as direction,
            null::uuid as reservation_id, ep.expense_id
       from public.expense_payments ep
       join public.expenses e on e.id = ep.expense_id and e.organization_id = p_org
@@ -1498,7 +1504,7 @@ begin
   )
   select coalesce(jsonb_agg(jsonb_build_object(
            'occurred_at', sel.at_, 'source', case sel.src when 1 then 'RESERVATION' else 'EXPENSE' end,
-           'source_kind', sel.src, 'direction', case sel.src when 1 then 'IN' else 'OUT' end,
+           'source_kind', sel.src, 'direction', sel.direction,
            'id', sel.id, 'kind', sel.kind, 'method', sel.method, 'amount', sel.amount, 'signed_amount', sel.signed_amount,
            'reservation_id', sel.reservation_id, 'reservation_start_at', rs.start_at, 'court_name', ct.name,
            'customer_name', cu.name,

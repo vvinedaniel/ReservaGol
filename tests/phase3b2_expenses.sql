@@ -626,6 +626,40 @@ begin
     (c->'totals')::text);
 end $$;
 
+-- ============================================================================= T62 direção real dos movimentos
+do $$
+declare m jsonb; v_bad int; v_n int;
+begin
+  m := pg_temp.do_('owner', pg_temp.q_mv(pg_temp.k('org'), null, pg_temp.dd(-20), pg_temp.dd(0), 200));
+  perform pg_temp.ok('T62a os 4 tipos de movimento com direção real e sinal coerente',
+    -- 1) reserva PAYMENT => IN / positivo
+    exists (select 1 from jsonb_array_elements(m->'items') e where (e->>'id')::uuid = pg_temp.k('rp1')
+             and e->>'source' = 'RESERVATION' and e->>'kind' = 'PAYMENT' and e->>'direction' = 'IN' and (e->>'signed_amount')::bigint = 30000)
+    -- 2) reserva REFUND => OUT / negativo (estorno ao cliente sai do caixa)
+    and exists (select 1 from jsonb_array_elements(m->'items') e where e->>'source' = 'RESERVATION' and e->>'kind' = 'REFUND'
+             and e->>'direction' = 'OUT' and (e->>'signed_amount')::bigint = -5000)
+    -- 3) despesa PAYMENT => OUT / negativo
+    and exists (select 1 from jsonb_array_elements(m->'items') e where (e->>'id')::uuid = pg_temp.k('p_paid')
+             and e->>'source' = 'EXPENSE' and e->>'kind' = 'PAYMENT' and e->>'direction' = 'OUT' and (e->>'signed_amount')::bigint = -15000)
+    -- 4) despesa REVERSAL => IN / positivo (devolução do fornecedor entra no caixa)
+    and exists (select 1 from jsonb_array_elements(m->'items') e where (e->>'id')::uuid = pg_temp.k('r_rev')
+             and e->>'source' = 'EXPENSE' and e->>'kind' = 'REVERSAL' and e->>'direction' = 'IN' and (e->>'signed_amount')::bigint = 12000),
+    m::text);
+  select count(*) filter (where not ((e->>'direction' = 'IN' and (e->>'signed_amount')::bigint > 0)
+                                     or (e->>'direction' = 'OUT' and (e->>'signed_amount')::bigint < 0))),
+         count(*)
+    into v_bad, v_n
+    from jsonb_array_elements(m->'items') e;
+  perform pg_temp.ok('T62b invariante em todos os itens: direction = IN sse signed_amount > 0; OUT sse < 0; nenhum zero',
+    v_bad = 0 and v_n = 10, format('itens=%s violações=%s', v_n, v_bad));
+  perform pg_temp.ok('T62c source/source_kind continuam indicando o domínio de origem (não a direção)',
+    not exists (select 1 from jsonb_array_elements(m->'items') e
+                 where not ((e->>'source' = 'RESERVATION' and (e->>'source_kind')::int = 1)
+                            or (e->>'source' = 'EXPENSE' and (e->>'source_kind')::int = 2)))
+    and exists (select 1 from jsonb_array_elements(m->'items') e where e->>'source' = 'RESERVATION' and e->>'direction' = 'OUT')
+    and exists (select 1 from jsonb_array_elements(m->'items') e where e->>'source' = 'EXPENSE' and e->>'direction' = 'IN'), 'ok');
+end $$;
+
 -- ============================================================================= T43–T50 seed / categorias / privilégios
 do $$
 declare v_o3 uuid; v_n int; r jsonb; v_lid uuid; v_bad text; v_cnt int;
