@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useMe } from '@/components/reserva/dashboard-shell'
 import { StatCard } from '@/components/reserva/stat-card'
@@ -8,6 +8,11 @@ import { EmptyState } from '@/components/reserva/empty-state'
 import { DemoBadge } from '@/components/reserva/demo-badge'
 import { statusMeta } from '@/lib/reserva/status'
 import { buildSlots, overlaps, fmtTime, todayStr } from '@/lib/reserva/time'
+import { canViewFinance } from '@/lib/auth/permissions'
+import { createRequestSequence, runLatest } from '@/lib/reserva/latest-request'
+import { resolvePeriod } from '@/lib/reserva/finance-period'
+import { fetchFinance, periodParams } from '@/lib/reserva/finance-client'
+import { formatCents } from '@/lib/reserva/money'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -22,6 +27,24 @@ export default function OverviewPage() {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [pubCheck, setPubCheck] = useState(null)
+  // 03B.1: cards financeiros do mês só para OWNER/MANAGER; para os demais nada é buscado.
+  const showFinance = canViewFinance(me?.role)
+  const [fin, setFin] = useState({ loading: true, data: null, error: false })
+  const finSeq = useRef(null)
+  if (!finSeq.current) finSeq.current = createRequestSequence()
+
+  useEffect(() => {
+    if (!orgId || !showFinance) return
+    const seq = finSeq.current
+    const month = resolvePeriod('this_month', todayStr())
+    if (!month) return
+    runLatest(seq, () => fetchFinance('overview', periodParams(orgId, null, month)), {
+      onStart: () => setFin({ loading: true, data: null, error: false }),
+      onResult: (d) => setFin({ loading: false, data: d, error: false }),
+      onError: () => setFin({ loading: false, data: null, error: true }),
+    })
+    return () => seq.invalidate()
+  }, [orgId, showFinance])
 
   useEffect(() => {
     if (!orgId) return
@@ -79,11 +102,19 @@ export default function OverviewPage() {
         </Card>
       )}
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard label="Receita" value="R$ 0,00" hint="Em breve" icon={DollarSign} accent="muted" />
+      <div className={cn('grid gap-4 sm:grid-cols-2', showFinance && 'lg:grid-cols-4')}>
+        {showFinance && (
+          <StatCard label="Valor das reservas (mês)" icon={DollarSign}
+            value={fin.loading || fin.error ? '—' : formatCents(fin.data?.expected_revenue?.current) || '—'}
+            hint={fin.error ? 'Indisponível no momento' : 'Reservas com valor neste mês'} />
+        )}
         <StatCard label="Reservas de hoje" value={loading ? '—' : String(bookings.length)} hint="Confirmadas e pendentes" icon={CalendarCheck} />
         <StatCard label="Ocupação de hoje" value={loading ? '—' : `${occupancy}%`} hint={total ? `${occupied}/${total} horários` : 'Sem horários'} icon={Percent} />
-        <StatCard label="Ticket médio" value="R$ 0,00" hint="Em breve" icon={Receipt} accent="muted" />
+        {showFinance && (
+          <StatCard label="Ticket médio (mês)" icon={Receipt}
+            value={fin.loading || fin.error || fin.data?.average_ticket?.current == null ? '—' : formatCents(fin.data.average_ticket.current)}
+            hint={fin.error ? 'Indisponível no momento' : fin.data && fin.data.average_ticket?.current == null ? 'Nenhuma reserva com valor neste mês' : 'Por reserva com valor neste mês'} />
+        )}
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">

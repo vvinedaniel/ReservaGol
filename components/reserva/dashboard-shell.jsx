@@ -6,7 +6,7 @@ import Link from 'next/link'
 import { createClient } from '@/lib/supabase/browser'
 import { Logo } from '@/components/reserva/logo'
 import { DemoBadge } from '@/components/reserva/demo-badge'
-import { can, FEATURES, ROLE_LABELS } from '@/lib/auth/permissions'
+import { can, canViewFinance, FEATURES, ROLE_LABELS } from '@/lib/auth/permissions'
 import { Button } from '@/components/ui/button'
 import { Sheet, SheetContent, SheetTrigger, SheetTitle } from '@/components/ui/sheet'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
@@ -29,7 +29,8 @@ const NAV = [
   { label: 'Quadras', href: '/dashboard/quadras', icon: LayoutGrid, feature: FEATURES.COURTS, ready: true },
   { label: 'Perfil da arena', href: '/dashboard/perfil', icon: Globe, feature: FEATURES.SETTINGS_ARENA, ready: true },
   { label: 'Clientes', href: '/dashboard/clientes', icon: Users, feature: FEATURES.CUSTOMERS, ready: false },
-  { label: 'Financeiro', href: '/dashboard/financeiro', icon: DollarSign, feature: FEATURES.FINANCE, ready: false },
+  // 03B.1: Financeiro agregado só para OWNER/MANAGER (canViewFinance), não pela matriz genérica.
+  { label: 'Financeiro', href: '/dashboard/financeiro', icon: DollarSign, feature: FEATURES.FINANCE, allow: canViewFinance, ready: true },
   { label: 'Relatórios', href: '/dashboard/relatorios', icon: BarChart3, feature: FEATURES.REPORTS, ready: false },
   { label: 'Campanhas', href: '/dashboard/campanhas', icon: Megaphone, feature: FEATURES.CAMPAIGNS, ready: false },
   { label: 'Equipe', href: '/dashboard/equipe', icon: UsersRound, feature: FEATURES.TEAM, ready: false },
@@ -38,7 +39,7 @@ const NAV = [
 
 function NavLinks({ role, onNavigate }) {
   const pathname = usePathname()
-  const items = NAV.filter((i) => can(role, i.feature) || i.feature === FEATURES.SETTINGS_USER)
+  const items = NAV.filter((i) => (i.allow ? i.allow(role) : can(role, i.feature) || i.feature === FEATURES.SETTINGS_USER))
   return (
     <nav className="flex flex-col gap-1">
       {items.map((item) => {
