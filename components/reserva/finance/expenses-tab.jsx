@@ -4,27 +4,33 @@
 // fora dela). Fontes: rg_expense_overview (cards), rg_expenses (lista paginada por cursor),
 // rg_expense_categories (filtro) e rg_expense_detail (Sheet). Toda carga usa runLatest com as
 // sequências recebidas da página; trocar filtro invalida SINCRONAMENTE as cargas em andamento.
-// Nenhuma escrita nesta etapa.
+// FASE 03B.2B-2B: entradas de escrita "Nova despesa" e "Categorias" (formulários em expense-forms.jsx /
+// expense-categories-dialog.jsx). Depois de qualquer mutação a lista e o resumo recarregam em segundo
+// plano (reload) e as categorias recarregam (catsReload) — nada otimista.
 import { useEffect, useRef, useState } from 'react'
+import { toast } from 'sonner'
 import { runLatest } from '@/lib/reserva/latest-request'
 import { EXPENSE_STATUS_FILTERS, DEFAULT_EXPENSE_FILTER, EXPENSE_FILTER_LABELS, fmtDueDate } from '@/lib/reserva/expenses'
+import { successMessage } from '@/lib/reserva/expense-mutation'
 import { pctChange, fmtPeriodShort } from '@/lib/reserva/finance-period'
 import { formatCents } from '@/lib/reserva/money'
 import { EmptyState } from '@/components/reserva/empty-state'
 import { ExpenseBadges, ExpenseDetailSheet } from '@/components/reserva/finance/expense-detail-sheet'
+import { ExpenseFormDialog } from '@/components/reserva/finance/expense-forms'
+import { ExpenseCategoriesDialog } from '@/components/reserva/finance/expense-categories-dialog'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { AlertTriangle, ArrowDownRight, ArrowUpRight, CalendarClock, CheckCircle2, Clock, Info, Loader2, Minus, ReceiptText, RefreshCw } from 'lucide-react'
+import { AlertTriangle, ArrowDownRight, ArrowUpRight, CalendarClock, CheckCircle2, Clock, Info, Loader2, Minus, Plus, ReceiptText, RefreshCw, Tags } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const PAGE_SIZE = 50
 const ALL_CATEGORIES = 'all'
 export const GENERAL_EXCLUDED_MSG = 'Despesas gerais da organização não estão incluídas neste filtro.'
 
-export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden }) {
+export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden, arenas = [] }) {
   const [categoryId, setCategoryId] = useState(null)
   const [status, setStatus] = useState(DEFAULT_EXPENSE_FILTER)
   const [reload, setReload] = useState(0)
@@ -34,6 +40,8 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden }) {
   const [more, setMore] = useState({ loading: false, error: false })
   const [openId, setOpenId] = useState(null)
   const lastTrigger = useRef(null)
+  const [dialog, setDialog] = useState(null) // 'create' | 'categories'
+  const [catsReload, setCatsReload] = useState(0)
 
   // Categorias (inclusive inativas, marcadas) só para o filtro.
   useEffect(() => {
@@ -42,7 +50,7 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden }) {
       onError: (e) => { if (e?.status === 403) onForbidden(); setCats({ ready: true, list: [] }) },
     })
     return () => seqs.cats.invalidate()
-  }, [scope.orgId])
+  }, [scope.orgId, catsReload])
 
   // Cards: período/arena/categoria + período de comparação (status não se aplica ao resumo). baseKey só
   // tem from/to; a comparação pode mudar com o mesmo from/to (ex.: atalho -> personalizado), então
@@ -96,6 +104,13 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden }) {
   const openDetail = (id, el) => { lastTrigger.current = el; setOpenId(id) }
   const closeDetail = () => { seqs.detail.invalidate(); setOpenId(null) }
   const retry = () => setReload((n) => n + 1)
+  const reloadCats = () => setCatsReload((n) => n + 1)
+  // Despesa criada: fecha o formulário, recarrega lista/resumo e oferece abrir a despesa criada.
+  const onCreated = async ({ expenseId, idempotent }) => {
+    setDialog(null)
+    toast.success(successMessage('create', { idempotent }), expenseId ? { action: { label: 'Abrir', onClick: () => openDetail(expenseId, null) } } : undefined)
+    retry()
+  }
   const excludesGeneral = ov.data?.excludes_general === true || list.excludesGeneral
 
   return (
@@ -104,6 +119,10 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden }) {
         <div>
           <h2 className="font-display text-lg font-semibold">Despesas</h2>
           <p className="text-xs text-muted-foreground">Despesas com vencimento no período selecionado.</p>
+        </div>
+        <div className="flex w-full gap-2 sm:w-auto">
+          <Button variant="outline" className="h-11 flex-1 sm:h-9 sm:flex-none" disabled={!cats.ready} onClick={() => setDialog('categories')}><Tags className="mr-1.5 h-4 w-4" /> Categorias</Button>
+          <Button className="h-11 flex-1 sm:h-9 sm:flex-none" disabled={!cats.ready} onClick={() => setDialog('create')}><Plus className="mr-1.5 h-4 w-4" /> Nova despesa</Button>
         </div>
       </div>
 
@@ -141,7 +160,16 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden }) {
         </div>
       )}
 
-      {openId && <ExpenseDetailSheet expenseId={openId} api={api} seq={seqs.detail} onClose={closeDetail} onForbidden={onForbidden} returnFocusTo={lastTrigger} />}
+      {openId && (
+        <ExpenseDetailSheet expenseId={openId} api={api} seq={seqs.detail} onClose={closeDetail} onForbidden={onForbidden} returnFocusTo={lastTrigger}
+          orgId={scope.orgId} arenas={arenas} categories={cats.list} onChanged={retry} onCategoriesChanged={reloadCats} />
+      )}
+      {dialog === 'create' && (
+        <ExpenseFormDialog mode="create" api={api} orgId={scope.orgId} arenas={arenas} categories={cats.list} onClose={() => setDialog(null)} onDone={onCreated} onCategoriesChanged={reloadCats} />
+      )}
+      {dialog === 'categories' && (
+        <ExpenseCategoriesDialog api={api} orgId={scope.orgId} categories={cats.list} onClose={() => setDialog(null)} onChanged={reloadCats} />
+      )}
     </div>
   )
 }

@@ -162,7 +162,7 @@ function FinanceView({ me }) {
           {tab === 'overview' && <OverviewTab seq={seqs.current.overview} base={base} baseKey={baseKey} period={period} onForbidden={onForbidden} onUnpriced={openUnpriced} />}
           {tab === 'receivables' && <ReceivablesTab seqMain={seqs.current.rec} seqMore={seqs.current.recMore} base={base} baseKey={baseKey} filter={recFilter} onFilterChange={changeFilter} role={me?.role} onForbidden={onForbidden} />}
           {tab === 'cash' && <CashTab api={api} seqs={{ result: seqs.current.cashResult, moves: seqs.current.cashMoves, more: seqs.current.cashMovesMore }} scope={scope} baseKey={baseKey} period={period} onForbidden={onForbidden} />}
-          {tab === 'expenses' && <ExpensesTab api={api} seqs={{ cats: seqs.current.expCats, overview: seqs.current.expOverview, list: seqs.current.expList, more: seqs.current.expListMore, detail: seqs.current.expDetail }} scope={scope} baseKey={baseKey} onForbidden={onForbidden} />}
+          {tab === 'expenses' && <ExpensesTab api={api} seqs={{ cats: seqs.current.expCats, overview: seqs.current.expOverview, list: seqs.current.expList, more: seqs.current.expListMore, detail: seqs.current.expDetail }} scope={scope} baseKey={baseKey} onForbidden={onForbidden} arenas={arenas.list} />}
         </>
       )}
     </div>

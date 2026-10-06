@@ -650,15 +650,18 @@ await check('L03 RECEPTIONIST: nada da 03B.2 é criado/montado antes do guard ca
   }
   for (const role of [ROLES.OWNER, ROLES.MANAGER]) assert.equal(canViewFinance(role), true)
 })
-await check('L04 nenhuma escrita na UI desta etapa (sem POST/PATCH, sem formulário, sem ação financeira)', () => {
+// B-2B: a escrita passou a existir, mas SÓ nos diálogos (expense-forms / expense-categories-dialog,
+// cobertos em tests/phase3b2b_mutations.test.mjs). Página, Caixa, aba e detalhe não chamam escrita direto.
+await check('L04 escrita só pelos diálogos da B-2B: página/Caixa sem escrita; aba/detalhe sem chamada direta de mutação', () => {
+  const WRITES = ['createExpense', 'updateExpense', 'cancelExpense', 'registerPayment', 'reversePayment', 'voidPayment', 'createCategory', 'updateCategory']
   for (const [f, code] of UI) {
-    for (const bad of ['createExpense', 'updateExpense', 'cancelExpense', 'registerPayment', 'reversePayment', 'voidPayment', 'createCategory', 'updateCategory', 'sendExpense', "method: 'POST'", "method: 'PATCH'", 'newOperationId', 'createOperationIntent'])
-      assert.ok(!(/^[A-Za-z]+$/.test(bad) ? new RegExp(`\\b${bad}\\b`).test(code) : code.includes(bad)), `${f}: ${bad}`)
+    for (const w of WRITES) assert.ok(!new RegExp(`api\\.${w}\\(`).test(code), `${f}: api.${w}( direto`)
+    for (const bad of ['sendExpense', "method: 'POST'", "method: 'PATCH'", 'newOperationId']) assert.ok(!code.includes(bad), `${f}: ${bad}`)
   }
-  for (const label of ['Nova despesa', 'Editar', 'Registrar pagamento', 'Registrar devolução', 'Anular', 'Cancelar despesa']) {
-    assert.ok(!EXP_TAB.includes(label) && !DETAIL.includes(label), label)
+  for (const [f, code] of [['page', PAGE_SRC], ['cash-tab', CASH_TAB]]) {
+    for (const w of [...WRITES, 'ExpenseFormDialog', 'EntryDialog', 'ReasonDialog', 'ExpenseCategoriesDialog']) assert.ok(!new RegExp(`\\b${w}\\b`).test(code), `${f}: ${w}`)
   }
-  assert.ok(!fs.existsSync(new URL('../components/reserva/finance/expense-forms.jsx', import.meta.url)) && !fs.existsSync(new URL('../components/reserva/finance/expense-categories-dialog.jsx', import.meta.url)))
+  assert.ok(fs.existsSync(new URL('../components/reserva/finance/expense-forms.jsx', import.meta.url)) && fs.existsSync(new URL('../components/reserva/finance/expense-categories-dialog.jsx', import.meta.url)))
 })
 await check('L05 toda chamada à API nos componentes passa por runLatest com sequência da página', () => {
   for (const [f, code, n] of [['expenses-tab', EXP_TAB, 4], ['detail', DETAIL, 1], ['cash-tab', CASH_TAB, 3]]) {
@@ -721,7 +724,9 @@ await check('S01 Sheet: Title + Description, largura total no mobile, rolagem, f
   for (const f of ['d.category_name', "d.arena_id ? d.arena_name : 'Geral'", 'formatCents(d.amount)', 'fmtDueDate(d.due_date)', 'd.notes', 'formatCents(d.paid_gross)', 'formatCents(d.reversed)', 'formatCents(d.net_paid)', 'formatCents(d.amount_due)'])
     assert.ok(DETAIL.includes(f), f)
   for (const f of ["reversal ? 'Devolução' : 'Pagamento'", 'PAYMENT_METHOD_LABELS[e.method]', 'fmtDateTimeLong(e.paid_at)', 'e.void_reason', 'byId[e.reversal_of]', 'Devolução do pagamento']) assert.ok(DETAIL.includes(f), f)
-  assert.ok(!/<Button[^>]*onClick=\{[^}]*(pay|reverse|void|cancel|edit)/i.test(DETAIL), 'nenhum botão de ação financeira')
+  // B-2B: ações só pelo estado real devolvido pelo banco (deriveExpenseActions)
+  assert.ok(DETAIL.includes('const a = d ? deriveExpenseActions(d) : null'))
+  for (const g of ['{a.canPay && <Button', '{a.canEdit && <Button', '{a.canCancel && <Button', '{e.canReverse && <Button']) assert.ok(DETAIL.includes(g), g)
 })
 
 // ---------------------------------------------------------------- Caixa

@@ -1,40 +1,54 @@
 'use client'
 
-// FASE 03B.2B-2A — detalhe de UMA despesa (somente leitura). Tudo vem de rg_expense_detail via
-// /api/finance/expenses/:id; nenhuma ação de escrita aqui (B-2B). Sequência própria (expDetail):
-// abrir outra despesa ou fechar o Sheet invalida a requisição anterior — resposta antiga nunca
-// substitui a despesa aberta agora.
+// FASE 03B.2B-2A — detalhe de UMA despesa. Tudo vem de rg_expense_detail via /api/finance/expenses/:id.
+// Sequência própria (expDetail): abrir outra despesa ou fechar o Sheet invalida a requisição anterior —
+// resposta antiga nunca substitui a despesa aberta agora.
+// FASE 03B.2B-2B — ações pelo ESTADO REAL do banco (deriveExpenseActions): Editar, Registrar pagamento,
+// Cancelar despesa e, por lançamento, Registrar devolução / Anular lançamento. Os formulários ficam em
+// expense-forms.jsx. Depois de cada mutação (ou de recusa por estado), o detalhe é recarregado em
+// segundo plano e a aba é avisada (onChanged) — nada otimista.
 import { useEffect, useState } from 'react'
 import { runLatest } from '@/lib/reserva/latest-request'
-import { expenseBadges, fmtDueDate } from '@/lib/reserva/expenses'
+import { expenseBadges, fmtDueDate, deriveExpenseActions } from '@/lib/reserva/expenses'
 import { formatCents } from '@/lib/reserva/money'
 import { PAYMENT_METHOD_LABELS } from '@/lib/reserva/finance'
 import { fmtDateTimeLong } from '@/lib/reserva/time'
+import { ExpenseFormDialog, EntryDialog, ReasonDialog } from '@/components/reserva/finance/expense-forms'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import { AlertTriangle, RefreshCw } from 'lucide-react'
+import { AlertTriangle, Ban, Loader2, Pencil, Plus, RefreshCw, Undo2, XCircle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 export function ExpenseBadges({ row, className }) {
   return expenseBadges(row).map((b) => <Badge key={b.key} className={cn('border font-normal', b.badge, className)}>{b.label}</Badge>)
 }
 
-export function ExpenseDetailSheet({ expenseId, api, seq, onClose, onForbidden, returnFocusTo }) {
+export function ExpenseDetailSheet({ expenseId, api, seq, onClose, onForbidden, returnFocusTo, orgId, arenas = [], categories = [], onChanged, onCategoriesChanged }) {
   const [st, setSt] = useState({ loading: true, error: false, data: null })
   const [reload, setReload] = useState(0)
+  const [dlg, setDlg] = useState(null)
 
   useEffect(() => {
     runLatest(seq, () => api.detail(expenseId), {
-      onStart: () => setSt({ loading: true, error: false, data: null }),
+      // recarga da MESMA despesa mantém o conteúdo visível; outra despesa nunca herda dados da anterior
+      onStart: () => setSt((s) => ({ loading: true, error: false, data: s.data?.expense_id === expenseId ? s.data : null })),
       onResult: (d) => setSt({ loading: false, error: false, data: d }),
       onError: (e) => { if (e?.status === 403) onForbidden(); setSt({ loading: false, error: true, data: null, notFound: e?.status === 404 }) },
     })
     return () => seq.invalidate()
   }, [expenseId, reload])
 
+  // Depois de uma mutação (ou recusa por estado): recarrega o detalhe e avisa a aba (lista + resumo).
+  const done = async (opts) => {
+    if (!opts?.keepOpen) setDlg(null)
+    setReload((n) => n + 1)
+    onChanged?.()
+  }
+
   const d = st.data
+  const a = d ? deriveExpenseActions(d) : null
   return (
     <Sheet open onOpenChange={(o) => { if (!o) onClose() }}>
       <SheetContent
@@ -50,13 +64,42 @@ export function ExpenseDetailSheet({ expenseId, api, seq, onClose, onForbidden, 
             <p className="text-sm text-muted-foreground">{st.notFound ? 'Despesa não encontrada.' : 'Não foi possível carregar a despesa.'}</p>
             {!st.notFound && <Button variant="outline" className="h-11 sm:h-9" onClick={() => setReload((n) => n + 1)}><RefreshCw className="mr-2 h-4 w-4" /> Tentar novamente</Button>}
           </div>
-        ) : st.loading || !d ? (
+        ) : !d ? (
           <div className="mt-6 space-y-3" role="status" aria-label="Carregando despesa">
             <Skeleton className="h-6 w-40" /><Skeleton className="h-24 w-full" /><Skeleton className="h-32 w-full" />
           </div>
-        ) : <ExpenseDetailBody d={d} />}
+        ) : (
+          <div aria-busy={st.loading}>
+            {st.loading && (
+              <p className="mt-3 flex items-center gap-2 text-xs text-muted-foreground" role="status" aria-live="polite">
+                <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" /> Atualizando…
+              </p>
+            )}
+            <ExpenseActions a={a} busy={st.loading} onEdit={() => setDlg({ type: 'edit' })} onPay={() => setDlg({ type: 'payment' })} onCancel={() => setDlg({ type: 'cancel' })} />
+            <ExpenseDetailBody d={d} a={a} busy={st.loading} onReverse={(e) => setDlg({ type: 'reverse', entry: e })} onVoid={(e) => setDlg({ type: 'void', entry: e })} />
+          </div>
+        )}
+        {d && dlg?.type === 'edit' && (
+          <ExpenseFormDialog mode="edit" api={api} orgId={orgId} arenas={arenas} categories={categories} detail={d} onClose={() => setDlg(null)} onDone={done} onCategoriesChanged={onCategoriesChanged} />
+        )}
+        {d && dlg?.type === 'payment' && <EntryDialog kind="payment" api={api} expense={d} onClose={() => setDlg(null)} onDone={done} />}
+        {d && dlg?.type === 'reverse' && <EntryDialog kind="reverse" api={api} expense={d} entry={dlg.entry} onClose={() => setDlg(null)} onDone={done} />}
+        {d && dlg?.type === 'void' && <ReasonDialog kind="void" api={api} expense={d} entry={dlg.entry} onClose={() => setDlg(null)} onDone={done} />}
+        {d && dlg?.type === 'cancel' && <ReasonDialog kind="cancel" api={api} expense={d} onClose={() => setDlg(null)} onDone={done} />}
       </SheetContent>
     </Sheet>
+  )
+}
+
+// Ações da despesa: só as que o estado real permite (o banco continua decidindo).
+function ExpenseActions({ a, busy, onEdit, onPay, onCancel }) {
+  if (!a || (!a.canEdit && !a.canPay && !a.canCancel)) return null
+  return (
+    <div className="mt-4 flex flex-wrap gap-2">
+      {a.canPay && <Button className="h-11 sm:h-9" disabled={busy} onClick={onPay}><Plus className="mr-1.5 h-4 w-4" /> Registrar pagamento</Button>}
+      {a.canEdit && <Button variant="outline" className="h-11 sm:h-9" disabled={busy} onClick={onEdit}><Pencil className="mr-1.5 h-4 w-4" /> Editar</Button>}
+      {a.canCancel && <Button variant="outline" className="h-11 hover:text-destructive sm:h-9" disabled={busy} onClick={onCancel}><XCircle className="mr-1.5 h-4 w-4" /> Cancelar despesa</Button>}
+    </div>
   )
 }
 
@@ -72,8 +115,8 @@ function Amount({ label, value, strong }) {
   )
 }
 
-function ExpenseDetailBody({ d }) {
-  const entries = Array.isArray(d.entries) ? d.entries : []
+function ExpenseDetailBody({ d, a, busy, onReverse, onVoid }) {
+  const entries = a ? a.entries : (Array.isArray(d.entries) ? d.entries : [])
   const byId = Object.fromEntries(entries.map((e) => [e.payment_id, e]))
   return (
     <div className="mt-4 space-y-5">
@@ -113,6 +156,16 @@ function ExpenseDetailBody({ d }) {
                   {reversal && <p className="text-muted-foreground">Devolução do pagamento{parent ? ` de ${fmtDateTimeLong(parent.paid_at)} (${formatCents(parent.amount)})` : ''}</p>}
                   {!reversal && e.reversed > 0 && <p className="text-muted-foreground">Devolvido deste pagamento: {formatCents(e.reversed)}</p>}
                   {e.voided_at && <p className="text-muted-foreground">Anulado em {fmtDateTimeLong(e.voided_at)}{e.void_reason ? ` · Motivo: ${e.void_reason}` : ''}</p>}
+                  {(e.canReverse || e.canVoid || e.voidBlocked) && (
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {e.canReverse && <Button size="sm" variant="outline" className="h-11 sm:h-8" disabled={busy} onClick={() => onReverse(e)}><Undo2 className="mr-1 h-3.5 w-3.5" /> Registrar devolução</Button>}
+                      {(e.canVoid || e.voidBlocked) && (
+                        <Button size="sm" variant="ghost" className="h-11 hover:text-destructive sm:h-8" disabled={busy || !e.canVoid} onClick={() => onVoid(e)}
+                          aria-describedby={e.voidBlocked ? `void-blocked-${e.payment_id}` : undefined}><Ban className="mr-1 h-3.5 w-3.5" /> Anular lançamento</Button>
+                      )}
+                      {e.voidBlocked === 'HAS_REVERSALS' && <p id={`void-blocked-${e.payment_id}`} className="w-full text-muted-foreground">Anule primeiro as devoluções deste pagamento.</p>}
+                    </div>
+                  )}
                 </li>
               )
             })}
