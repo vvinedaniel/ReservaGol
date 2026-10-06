@@ -20,6 +20,8 @@ const PAGE = stripJsComments(read('app/dashboard/financeiro/page.js'))
 const PICKER = stripJsComments(read('components/reserva/finance/period-picker.jsx'))
 const DASH = stripJsComments(read('app/dashboard/page.js'))
 const SHELL = stripJsComments(read('components/reserva/dashboard-shell.jsx'))
+// K1 (03B.2B-2A): o Caixa saiu de page.js para o componente consolidado (entradas + saídas).
+const CASH = stripJsComments(read('components/reserva/finance/cash-tab.jsx'))
 
 const results = []
 async function check(name, fn) {
@@ -417,22 +419,28 @@ await check('U01 A receber e Inadimplência: "Situação atual" e sem comparaç�
     assert.ok(m &&m[1].includes('cmpLabel={cmpLabel}'), `${label}: comparação`)
   }
 })
-await check('U02 sem Despesas/Resultado/Faturamento/Saldo/Lucro nas telas da 03B.1', () => {
-  for (const [f, code] of [['financeiro', PAGE], ['period-picker', PICKER], ['dashboard', DASH]]) {
-    for (const bad of ['faturamento', 'saldo', 'lucro', 'resultado', 'despesa', 'saída']) assert.ok(!code.toLowerCase().includes(bad), `${f}: ${bad}`)
+await check('U02 sem Faturamento/Saldo/Lucro nas telas do Financeiro (K1: despesa/saída/resultado liberados pela 03B.2B)', () => {
+  for (const [f, code] of [['financeiro', PAGE], ['period-picker', PICKER], ['dashboard', DASH], ['cash-tab', CASH]]) {
+    for (const bad of ['faturamento', 'saldo', 'lucro']) assert.ok(!code.toLowerCase().includes(bad), `${f}: ${bad}`)
+  }
+  // a dashboard e o seletor continuam sem os termos da 03B.2 (não fazem parte desta evolução)
+  for (const [f, code] of [['period-picker', PICKER], ['dashboard', DASH]]) {
+    for (const bad of ['resultado', 'despesa', 'saída']) assert.ok(!code.toLowerCase().includes(bad), `${f}: ${bad}`)
   }
 })
 await check('U03 aviso de reservas sem valor + ação para A receber filtrado em UNPRICED', () => {
   assert.ok(PAGE.includes('reservas sem valor no período não entram na receita prevista.'))
-  assert.ok(PAGE.includes("const openUnpriced = () => { invalidateFinance(); setRecFilter('UNPRICED'); setTab('receivables') }"))
+  assert.ok(PAGE.includes("const openUnpriced = () => { invalidateFinance(); setRecFilter('UNPRICED'); navigate({ tab: 'receivables' }, { push: true }) }"))
   assert.ok(/\{unpriced > 0 && \(/.test(PAGE))
   assert.ok(/\{d\.credits\?\.count > 0 && \(/.test(PAGE), 'créditos só com count > 0')
 })
-await check('U04 Caixa: "Entradas de reservas no período", pagamentos/estornos/líquido, estorno negativo', () => {
-  assert.ok(PAGE.includes('Entradas de reservas no período'))
-  for (const t of ['label="Pagamentos"', 'label="Estornos"', 'label="Líquido"']) assert.ok(PAGE.includes(t), t)
-  assert.ok(PAGE.includes("{refund ? '-' : '+'}{formatCents(e.amount)}") && PAGE.includes("refund ? 'text-red-400'"))
-  assert.ok(PAGE.includes('`-${formatCents(t.refunds)}`'))
+await check('U04 Caixa (K1): consolidado em cash-tab.jsx — Entradas/Saídas/Resultado de caixa; estorno de reserva negativo pelo banco', () => {
+  assert.ok(PAGE.includes("import { CashTab } from '@/components/reserva/finance/cash-tab'"))
+  assert.ok(!PAGE.includes('Entradas de reservas no período') && !/function CashTab|function CashChart|function Total\(/.test(PAGE), 'Caixa antigo removido (sem duas Caixas)')
+  assert.ok(!/fetchFinance\('(cashflow|cash-entries)'/.test(PAGE), 'UI não usa mais cashflow/cash-entries')
+  for (const t of ['label="Entradas"', 'label="Saídas"', 'label="Resultado de caixa"']) assert.ok(CASH.includes(t), t)
+  // sinal/cor de cada movimento vem de direction/signed_amount (movementView), nunca da origem
+  assert.ok(CASH.includes('const v = movementView(m)') && CASH.includes("v.tone === 'in' ? 'text-primary' : v.tone === 'out' ? 'text-red-400'"))
 })
 await check('U05 linha de A receber abre o FinancePanel existente (sem segundo fluxo de pagamento)', () => {
   assert.ok(PAGE.includes("import { FinancePanel, PaymentStatusBadge } from '@/components/reserva/finance-panel'"))
@@ -444,16 +452,17 @@ await check('U06 seletor: atalhos, arena só com mais de uma, URL ?preset / ?fro
   assert.ok(PICKER.includes('applyDateInput(s.date, e.target.value)') && PICKER.includes('onBlur={() => setFrom((s) => ({ dateInput: s.date, date: s.date }))}'))
   assert.ok(PICKER.includes('disabled={!!err}') && PICKER.includes('if (!isValidCustomPeriod(from.date, to.date)) return'))
   assert.ok(PAGE.includes('const period = useMemo(() => periodFromSearch(searchParams, today), [searchParams, today])'))
-  assert.ok(PAGE.includes('replaceQuery(periodToSearch(p, arenaId))') && PAGE.includes('replaceQuery(periodToSearch(period, a))'))
+  assert.ok(PAGE.includes('const changePeriod = (p) => { invalidateFinance(); navigate({ period: p }) }') && PAGE.includes('const changeArena = (a) => { invalidateFinance(); navigate({ arenaId: a }) }'))
+  assert.ok(PAGE.includes('const qs = nextFinanceSearch({ period, arenaId: urlArena(arenaParam, arenas), tab }, change)'), 'query canônica (período + arena + aba)')
   assert.ok(PAGE.includes('isUuid(arenaParam) && arenas.list.some((a) => a.id === arenaParam)'), 'arena da URL validada contra a lista da organização')
 })
 
-await check('U07 mobile 390 px: totais do Caixa nunca truncados; rótulos do gráfico fora da coluna estreita', () => {
-  const total = /function Total\([^)]*\) \{([\s\S]*?)\n\}/.exec(PAGE)[1]
-  assert.ok(!total.includes('truncate'), 'valor do total não pode ser truncado')
-  assert.ok(total.includes('whitespace-nowrap') && total.includes('sm:block'))
-  assert.ok(PAGE.includes('<div className="grid gap-2 sm:grid-cols-3 sm:gap-4">'), 'totais empilhados no mobile')
-  const chart = /function CashChart\([^)]*\) \{([\s\S]*?)\n\}/.exec(PAGE)[1]
+await check('U07 mobile 390 px (K1: cash-tab.jsx): totais do Caixa nunca truncados; rótulos do gráfico fora da coluna estreita', () => {
+  const card = /function CashCard\([^)]*\) \{([\s\S]*?)\n\}/.exec(CASH)[1]
+  assert.ok(!card.includes('truncate'), 'valor do total não pode ser truncado')
+  assert.ok(card.includes('whitespace-nowrap'))
+  assert.ok(CASH.includes('<div className="grid gap-4 sm:grid-cols-3">'), 'totais empilhados no mobile')
+  const chart = /function CashChart\([^)]*\) \{([\s\S]*?)\n\}/.exec(CASH)[1]
   assert.ok(chart.includes("'absolute top-0 whitespace-nowrap'"), 'rótulos posicionados de forma absoluta')
   assert.ok(!/flex-1 truncate text-center/.test(chart), 'rótulos não ficam na largura da coluna')
 })
@@ -469,17 +478,17 @@ await check('U08 painel da reserva com SheetDescription (sem warning Radix de de
 await check('K01 toda carga financeira passa por runLatest; invalidação síncrona e no unmount', () => {
   const total = (PAGE.match(/fetchFinance\(/g) || []).length
   const wrapped = (PAGE.match(/runLatest\(seq\w*, \(\) => fetchFinance\(/g) || []).length
-  assert.equal(total, 6); assert.equal(wrapped, total)
+  assert.equal(total, 3); assert.equal(wrapped, total) // K1: as 3 chamadas do Caixa antigo saíram da página
   assert.ok(PAGE.includes("import { createRequestSequence, runLatest } from '@/lib/reserva/latest-request'"))
   assert.ok(PAGE.includes('useEffect(() => () => { for (const s of Object.values(seqs.current)) s.invalidate() }, [])'), 'unmount')
-  for (const h of ['const changePeriod = (p) => { invalidateFinance();', 'const changeArena = (a) => { invalidateFinance();', "const changeTab = (t) => { if (!TABS.includes(t) || t === tab) return; invalidateFinance();",
+  for (const h of ['const changePeriod = (p) => { invalidateFinance();', 'const changeArena = (a) => { invalidateFinance();', "const changeTab = (t) => { if (!FINANCE_TABS.includes(t) || t === tab) return; invalidateFinance();",
     'const changeFilter = (f) => { if (f === recFilter) return; seqs.current.rec.invalidate(); seqs.current.recMore.invalidate();']) assert.ok(PAGE.includes(h), h)
   assert.ok(PAGE.includes('return () => { seqMain.invalidate(); seqMore.invalidate() }'))
-  assert.ok(PAGE.includes('return () => { seqFlow.invalidate(); seqEntries.invalidate(); seqMore.invalidate() }'))
+  assert.ok(CASH.includes('return () => { seqs.result.invalidate(); seqs.moves.invalidate(); seqs.more.invalidate() }'), 'K1: Caixa no componente')
   assert.ok(DASH.includes('runLatest(seq, () => fetchFinance(') && DASH.includes('return () => seq.invalidate()'))
 })
 await check('K02 Carregar mais com sequência própria, invalidada por toda carga principal', () => {
-  assert.ok(PAGE.includes("recMore: createRequestSequence()") && PAGE.includes("entriesMore: createRequestSequence()"))
+  assert.ok(PAGE.includes("recMore: createRequestSequence()") && PAGE.includes("cashMovesMore: createRequestSequence()"))
   const rec = /function ReceivablesTab[\s\S]*?\n\}\n/.exec(PAGE)[0]
   const iEff = rec.indexOf('useEffect(() => {')
   assert.ok(rec.indexOf('seqMore.invalidate()', iEff) < rec.indexOf('runLatest(seqMain', iEff), 'invalida paginação antes da nova carga')

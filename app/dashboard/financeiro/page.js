@@ -1,8 +1,11 @@
 'use client'
 
-// FASE 03B.1 — Financeiro (leitura): Visão geral, A receber e Caixa (entradas de reservas).
-// Autoridade é o banco (RPCs rg_fin_* via /api/finance): esta tela só exibe. Somente OWNER/MANAGER
+// FASE 03B.1 — Financeiro (leitura): Visão geral, A receber e Caixa.
+// FASE 03B.2B-2A — + Despesas (leitura) e Caixa consolidado (entradas e saídas), em componentes próprios.
+// Autoridade é o banco (RPCs via /api/finance): esta tela só exibe. Somente OWNER/MANAGER
 // (canViewFinance); para os demais nada financeiro é buscado e a tela mostra acesso negado.
+// Aba, período e arena vivem SÓ na URL (?tab, ?preset | ?from&to, ?arena); toda troca reconstrói a
+// query canônica (lib/reserva/finance-nav) e só a aba ativa monta e busca.
 // Toda carga usa createRequestSequence + runLatest: resposta antiga nunca sobrescreve estado novo.
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { usePathname, useRouter, useSearchParams } from 'next/navigation'
@@ -12,12 +15,15 @@ import { FinancePanel, PaymentStatusBadge } from '@/components/reserva/finance-p
 import { PeriodPicker } from '@/components/reserva/finance/period-picker'
 import { canViewFinance } from '@/lib/auth/permissions'
 import { createRequestSequence, runLatest } from '@/lib/reserva/latest-request'
-import { periodFromSearch, periodToSearch, pctChange, fmtPeriodShort } from '@/lib/reserva/finance-period'
-import { fetchFinance, periodParams, cashflowGranularity } from '@/lib/reserva/finance-client'
+import { periodFromSearch, pctChange, fmtPeriodShort } from '@/lib/reserva/finance-period'
+import { fetchFinance, periodParams } from '@/lib/reserva/finance-client'
 import { isUuid } from '@/lib/reserva/finance-api'
+import { FINANCE_TABS, tabFromSearch, urlArena, nextFinanceSearch } from '@/lib/reserva/finance-nav'
+import { createExpensesApi } from '@/lib/reserva/expenses-client'
 import { formatCents } from '@/lib/reserva/money'
-import { PAYMENT_METHOD_LABELS } from '@/lib/reserva/finance'
 import { todayStr, fmtTime, fmtDateTimeLong, ARENA_TZ } from '@/lib/reserva/time'
+import { ExpensesTab } from '@/components/reserva/finance/expenses-tab'
+import { CashTab } from '@/components/reserva/finance/cash-tab'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -26,13 +32,14 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import {
   Wallet, CircleDollarSign, Receipt, CalendarCheck, Clock, AlertTriangle, ShieldAlert, ArrowUpRight, ArrowDownRight,
-  Minus, Loader2, Inbox, RefreshCw, BarChart3, Info, Gift,
+  Minus, Loader2, Inbox, RefreshCw, Info, Gift,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const RECEIVABLE_FILTER_LABELS = { OPEN: 'Em aberto', OVERDUE: 'Vencidas', UPCOMING: 'A vencer', UNPRICED: 'Sem valor' }
 const PAGE_SIZE = 50
-const TABS = ['overview', 'receivables', 'cash']
+const TAB_LABELS = { overview: 'Visão geral', receivables: 'A receber', cash: 'Caixa', expenses: 'Despesas' }
+const FINANCE_SEQS = ['overview', 'rec', 'recMore', 'cashResult', 'cashMoves', 'cashMovesMore', 'expCats', 'expOverview', 'expList', 'expListMore', 'expDetail']
 
 export default function FinanceiroPage() {
   const me = useMe()
@@ -58,7 +65,7 @@ function PageHeader({ orgName }) {
   return (
     <div>
       <h1 className="font-display text-2xl font-bold text-foreground">Financeiro</h1>
-      <p className="mt-1 text-sm text-muted-foreground">Valores e entradas das reservas{orgName ? ` da ${orgName}` : ''}.</p>
+      <p className="mt-1 text-sm text-muted-foreground">Reservas, caixa e despesas{orgName ? ` da ${orgName}` : ''}.</p>
     </div>
   )
 }
@@ -81,23 +88,27 @@ function FinanceView({ me }) {
   const [today] = useState(todayStr)
   const period = useMemo(() => periodFromSearch(searchParams, today), [searchParams, today])
   const arenaParam = searchParams.get('arena')
+  // Aba: fonte única é a URL (?tab); ausente/inválida => Visão geral. Voltar/avançar do navegador troca a aba.
+  const tab = tabFromSearch(searchParams)
 
   const [arenas, setArenas] = useState({ ready: false, list: [] })
-  const [tab, setTab] = useState('overview')
   const [recFilter, setRecFilter] = useState('OPEN')
   const [forbidden, setForbidden] = useState(false)
+  const api = useMemo(() => createExpensesApi(), [])
 
   // Uma sequência por carga; "mais" de cada lista tem sequência própria.
   const seqs = useRef(null)
   if (!seqs.current) {
     seqs.current = {
       arenas: createRequestSequence(), overview: createRequestSequence(), rec: createRequestSequence(), recMore: createRequestSequence(),
-      flow: createRequestSequence(), entries: createRequestSequence(), entriesMore: createRequestSequence(),
+      cashResult: createRequestSequence(), cashMoves: createRequestSequence(), cashMovesMore: createRequestSequence(),
+      expCats: createRequestSequence(), expOverview: createRequestSequence(), expList: createRequestSequence(), expListMore: createRequestSequence(),
+      expDetail: createRequestSequence(),
     }
   }
   const invalidateFinance = useCallback(() => {
     const s = seqs.current
-    for (const k of ['overview', 'rec', 'recMore', 'flow', 'entries', 'entriesMore']) s[k].invalidate()
+    for (const k of FINANCE_SEQS) s[k].invalidate()
   }, [])
   useEffect(() => () => { for (const s of Object.values(seqs.current)) s.invalidate() }, [])
 
@@ -116,12 +127,20 @@ function FinanceView({ me }) {
   const baseKey = base ? `${base.organization_id}|${base.arena_id || ''}|${base.from}|${base.to}` : ''
 
   // Mudança de intenção: invalida SINCRONAMENTE tudo o que está em andamento antes de trocar a URL.
-  const replaceQuery = (qs) => router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false })
-  const changePeriod = (p) => { invalidateFinance(); replaceQuery(periodToSearch(p, arenaId)) }
-  const changeArena = (a) => { invalidateFinance(); replaceQuery(periodToSearch(period, a)) }
-  const changeTab = (t) => { if (!TABS.includes(t) || t === tab) return; invalidateFinance(); setTab(t) }
+  // A query é sempre reconstruída do estado validado (período + arena + aba): nenhuma troca descarta
+  // as outras chaves e parâmetros inválidos antigos não são copiados. Aba entra no histórico (push).
+  const navigate = (change, { push = false } = {}) => {
+    const qs = nextFinanceSearch({ period, arenaId: urlArena(arenaParam, arenas), tab }, change)
+    const url = qs ? `${pathname}?${qs}` : pathname
+    if (push) router.push(url, { scroll: false })
+    else router.replace(url, { scroll: false })
+  }
+  const changePeriod = (p) => { invalidateFinance(); navigate({ period: p }) }
+  const changeArena = (a) => { invalidateFinance(); navigate({ arenaId: a }) }
+  const changeTab = (t) => { if (!FINANCE_TABS.includes(t) || t === tab) return; invalidateFinance(); navigate({ tab: t }, { push: true }) }
   const changeFilter = (f) => { if (f === recFilter) return; seqs.current.rec.invalidate(); seqs.current.recMore.invalidate(); setRecFilter(f) }
-  const openUnpriced = () => { invalidateFinance(); setRecFilter('UNPRICED'); setTab('receivables') }
+  const openUnpriced = () => { invalidateFinance(); setRecFilter('UNPRICED'); navigate({ tab: 'receivables' }, { push: true }) }
+  const scope = useMemo(() => (ready ? { orgId, arenaId, period } : null), [ready, orgId, arenaId, period])
   const onForbidden = useCallback(() => setForbidden(true), [])
 
   if (forbidden) return <FinanceAccessDenied />
@@ -131,17 +150,19 @@ function FinanceView({ me }) {
       <PageHeader orgName={me?.activeOrg?.name} />
       <PeriodPicker period={period} today={today} onChange={changePeriod} arenas={arenas.list} arenaId={arenaId} onArenaChange={changeArena} />
       <Tabs value={tab} onValueChange={changeTab}>
-        <TabsList className="grid w-full grid-cols-3 sm:inline-flex sm:w-auto">
-          <TabsTrigger value="overview">Visão geral</TabsTrigger>
-          <TabsTrigger value="receivables">A receber</TabsTrigger>
-          <TabsTrigger value="cash">Caixa</TabsTrigger>
-        </TabsList>
+        {/* Mobile: 4 abas com rolagem horizontal (sem esmagar o texto), alvo de toque de 44 px. */}
+        <div className="-mx-4 overflow-x-auto px-4 sm:mx-0 sm:px-0">
+          <TabsList className="inline-flex h-auto w-max">
+            {FINANCE_TABS.map((t) => <TabsTrigger key={t} value={t} className="h-11 px-4 motion-reduce:transition-none sm:h-7 sm:px-3">{TAB_LABELS[t]}</TabsTrigger>)}
+          </TabsList>
+        </div>
       </Tabs>
       {!ready ? <FinanceSkeletonBody /> : (
         <>
           {tab === 'overview' && <OverviewTab seq={seqs.current.overview} base={base} baseKey={baseKey} period={period} onForbidden={onForbidden} onUnpriced={openUnpriced} />}
           {tab === 'receivables' && <ReceivablesTab seqMain={seqs.current.rec} seqMore={seqs.current.recMore} base={base} baseKey={baseKey} filter={recFilter} onFilterChange={changeFilter} role={me?.role} onForbidden={onForbidden} />}
-          {tab === 'cash' && <CashTab seqFlow={seqs.current.flow} seqEntries={seqs.current.entries} seqMore={seqs.current.entriesMore} base={base} baseKey={baseKey} period={period} onForbidden={onForbidden} />}
+          {tab === 'cash' && <CashTab api={api} seqs={{ result: seqs.current.cashResult, moves: seqs.current.cashMoves, more: seqs.current.cashMovesMore }} scope={scope} baseKey={baseKey} period={period} onForbidden={onForbidden} />}
+          {tab === 'expenses' && <ExpensesTab api={api} seqs={{ cats: seqs.current.expCats, overview: seqs.current.expOverview, list: seqs.current.expList, more: seqs.current.expListMore, detail: seqs.current.expDetail }} scope={scope} baseKey={baseKey} onForbidden={onForbidden} arenas={arenas.list} />}
         </>
       )}
     </div>
@@ -349,144 +370,5 @@ function ReservationFinanceSheet({ item, role, onClose, onChanged }) {
         <FinancePanel reservationId={item.reservation_id} role={role} onChanged={onChanged} />
       </SheetContent>
     </Sheet>
-  )
-}
-
-// ------------------------------------------------------------------ Caixa (entradas de reservas)
-const MONTHS = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez']
-function bucketLabel(bucket, granularity) {
-  if (typeof bucket !== 'string' || bucket.length < 10) return ''
-  return granularity === 'month' ? `${MONTHS[Number(bucket.slice(5, 7)) - 1]}/${bucket.slice(2, 4)}` : `${bucket.slice(8, 10)}/${bucket.slice(5, 7)}`
-}
-
-function CashTab({ seqFlow, seqEntries, seqMore, base, baseKey, period, onForbidden }) {
-  const granularity = cashflowGranularity(period)
-  const [flow, setFlow] = useState({ loading: true, error: false, data: null })
-  const [list, setList] = useState({ loading: true, error: false, items: [], cursor: null })
-  const [more, setMore] = useState({ loading: false, error: false })
-  const [reload, setReload] = useState(0)
-
-  useEffect(() => {
-    seqMore.invalidate()
-    setMore({ loading: false, error: false })
-    runLatest(seqFlow, () => fetchFinance('cashflow', { ...base, granularity }), {
-      onStart: () => setFlow({ loading: true, error: false, data: null }),
-      onResult: (d) => setFlow({ loading: false, error: false, data: d }),
-      onError: (e) => { if (e?.status === 403) onForbidden(); setFlow({ loading: false, error: true, data: null }) },
-    })
-    runLatest(seqEntries, () => fetchFinance('cash-entries', { ...base, limit: PAGE_SIZE }), {
-      onStart: () => setList({ loading: true, error: false, items: [], cursor: null }),
-      onResult: (d) => setList({ loading: false, error: false, items: Array.isArray(d?.items) ? d.items : [], cursor: d?.next_cursor || null }),
-      onError: (e) => { if (e?.status === 403) onForbidden(); setList({ loading: false, error: true, items: [], cursor: null }) },
-    })
-    return () => { seqFlow.invalidate(); seqEntries.invalidate(); seqMore.invalidate() }
-  }, [baseKey, granularity, reload])
-
-  function loadMore() {
-    const cursor = list.cursor
-    if (!cursor || more.loading) return
-    runLatest(seqMore, () => fetchFinance('cash-entries', { ...base, limit: PAGE_SIZE, after_at: cursor.received_at, after_id: cursor.id }), {
-      onStart: () => setMore({ loading: true, error: false }),
-      onResult: (d) => setList((l) => ({ ...l, items: [...l.items, ...(Array.isArray(d?.items) ? d.items : [])], cursor: d?.next_cursor || null })),
-      onError: (e) => { if (e?.status === 403) onForbidden(); setMore({ loading: false, error: true }) },
-      onSettled: () => setMore((m) => ({ ...m, loading: false })),
-    })
-  }
-
-  if (flow.error || list.error) return <LoadError onRetry={() => setReload((n) => n + 1)} />
-  const t = flow.data?.totals
-  return (
-    <div className="space-y-5">
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="flex items-center gap-2 text-base"><BarChart3 className="h-4 w-4 text-primary" /> Entradas de reservas no período</CardTitle>
-          <p className="text-xs text-muted-foreground">Pagamentos e estornos de reservas registrados no período, pela data do recebimento.</p>
-        </CardHeader>
-        <CardContent className="space-y-5">
-          {flow.loading || !flow.data ? <Skeleton className="h-48 w-full" /> : (
-            <>
-              <div className="grid gap-2 sm:grid-cols-3 sm:gap-4">
-                <Total label="Pagamentos" value={formatCents(t?.in_gross)} />
-                <Total label="Estornos" value={t?.refunds > 0 ? `-${formatCents(t.refunds)}` : formatCents(0)} negative={t?.refunds > 0} />
-                <Total label="Líquido" value={formatCents(t?.in_net)} strong />
-              </div>
-              <CashChart buckets={flow.data.buckets || []} granularity={flow.data.granularity || granularity} />
-            </>
-          )}
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader className="pb-2"><CardTitle className="text-base">Lançamentos</CardTitle></CardHeader>
-        <CardContent className="p-0">
-          {list.loading ? <div className="space-y-2 p-4">{Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-12 w-full" />)}</div>
-            : list.items.length === 0 ? <div className="p-4"><EmptyState icon={Wallet} title="Nenhuma entrada no período" description="Pagamentos e estornos de reservas registrados no período aparecem aqui." /></div>
-              : (
-                <div className="divide-y divide-border">
-                  {list.items.map((e) => {
-                    const refund = e.kind === 'REFUND'
-                    return (
-                      <div key={e.payment_id} className="flex items-center justify-between gap-3 px-4 py-3">
-                        <div className="min-w-0">
-                          <p className="truncate text-sm font-medium">{refund ? 'Estorno' : 'Pagamento'} · {PAYMENT_METHOD_LABELS[e.method] || e.method}</p>
-                          <p className="text-xs text-muted-foreground">{fmtDateTimeLong(e.received_at)} · {e.customer_name || 'Sem cliente'}{e.court_name ? ` · ${e.court_name}` : ''}</p>
-                        </div>
-                        <span className={cn('shrink-0 text-sm font-semibold', refund ? 'text-red-400' : 'text-primary')}>{refund ? '-' : '+'}{formatCents(e.amount)}</span>
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
-        </CardContent>
-      </Card>
-      {!list.loading && list.cursor && (
-        <div className="flex flex-col items-center gap-2">
-          <Button variant="outline" onClick={loadMore} disabled={more.loading}>{more.loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />} Carregar mais</Button>
-          {more.error && <p className="text-xs text-amber-500">Não foi possível carregar mais. Tente novamente.</p>}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function Total({ label, value, negative, strong }) {
-  return (
-    // Mobile: rótulo | valor na mesma linha (valor nunca truncado); a partir de sm: empilhado em 3 colunas.
-    <div className="flex items-baseline justify-between gap-3 rounded-lg border border-border bg-muted/20 px-3 py-2 sm:block">
-      <p className="text-xs text-muted-foreground">{label}</p>
-      <p className={cn('whitespace-nowrap text-sm sm:text-base', strong ? 'font-bold' : 'font-semibold', negative && 'text-red-400')}>{value}</p>
-    </div>
-  )
-}
-
-// Barras para cima = pagamentos; para baixo (vermelho) = estornos. Só CSS (leve e responsivo).
-function CashChart({ buckets, granularity }) {
-  const max = buckets.reduce((m, b) => Math.max(m, b.in_gross || 0, b.refunds || 0), 0)
-  const hasRefunds = buckets.some((b) => (b.refunds || 0) > 0)
-  if (max === 0) return <p className="rounded-lg border border-dashed border-border px-3 py-8 text-center text-sm text-muted-foreground">Nenhuma entrada registrada no período.</p>
-  const pct = (v) => `${Math.max(v > 0 ? 2 : 0, Math.floor(((v || 0) * 100) / max))}%`
-  const step = Math.max(1, Math.ceil(buckets.length / 8))
-  return (
-    <div>
-      <div className="flex h-48 items-stretch gap-[2px] overflow-hidden sm:gap-1" role="img" aria-label="Gráfico de entradas de reservas">
-        {buckets.map((b) => (
-          <div key={b.bucket} className="flex min-w-0 flex-1 flex-col" title={`${bucketLabel(b.bucket, granularity)}: ${formatCents(b.in_gross)} em pagamentos${b.refunds ? `, -${formatCents(b.refunds)} em estornos` : ''}`}>
-            <div className={cn('flex items-end', hasRefunds ? 'h-2/3' : 'h-full')}><div className="mx-auto w-full max-w-12 rounded-t-sm bg-primary/80" style={{ height: pct(b.in_gross) }} /></div>
-            {hasRefunds && <div className="flex h-1/3 items-start border-t border-border"><div className="mx-auto w-full max-w-12 rounded-b-sm bg-red-400/80" style={{ height: pct(b.refunds) }} /></div>}
-          </div>
-        ))}
-      </div>
-      {/* Rótulos posicionados no centro da barra (não na largura da coluna, que no mobile tem poucos px). */}
-      <div className="relative mt-1 h-4 text-[10px] text-muted-foreground" aria-hidden="true">
-        {buckets.map((b, i) => (i % step === 0 ? (
-          <span key={b.bucket} className={cn('absolute top-0 whitespace-nowrap', i === 0 ? 'translate-x-0' : i === buckets.length - 1 ? '-translate-x-full' : '-translate-x-1/2')}
-            style={{ left: i === 0 ? 0 : `${((i * 2 + 1) * 50) / buckets.length}%` }}>{bucketLabel(b.bucket, granularity)}</span>
-        ) : null))}
-      </div>
-      <div className="mt-2 flex flex-wrap gap-4 text-xs text-muted-foreground">
-        <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm bg-primary/80" /> Pagamentos</span>
-        {hasRefunds && <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm bg-red-400/80" /> Estornos</span>}
-      </div>
-    </div>
   )
 }
