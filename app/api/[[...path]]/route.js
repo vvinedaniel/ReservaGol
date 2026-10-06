@@ -10,6 +10,7 @@ import { CREATE_STATUSES, EDIT_STATUSES } from '@/lib/reserva/status'
 import { PAYMENT_METHODS, PRICE_REASONS, normalizeFinanceNotes, NOTES_MAX_CHARS } from '@/lib/reserva/finance'
 import { runFinanceEndpoint } from '@/lib/reserva/finance-api'
 import { isExpenseEndpoint, financePathSegments, runExpenseRoute } from '@/lib/reserva/expenses-api'
+import { recurringMonthPathSegments, runRecurringMonthRoute } from '@/lib/reserva/recurring-month-api'
 
 // B1: sem headers CORS — a API só é consumida pelo próprio frontend (mesma origem).
 function json(data, status = 200) {
@@ -380,6 +381,7 @@ async function handleRoute(request, { params }) {
   try {
     if (resource === 'public') return await handlePublic(request, id, sub, method)
     if (resource === 'finance') return await handleFinance(request, id, sub, method)
+    if (resource === 'recurring-month') return await handleRecurringMonth(request, method)
     const { supabase, user } = await getContext(request)
     if (!user) return json({ error: 'Não autenticado' }, 401)
     const url = new URL(request.url)
@@ -998,10 +1000,8 @@ async function handleRoute(request, { params }) {
       if (method === 'GET' && !id) {
         const organization_id = url.searchParams.get('organization_id')
         if (!organization_id) return json({ error: 'organization_id é obrigatório' }, 400)
-        // top-up idempotente das séries ativas ao abrir a tela (RPC generate; falhas são registradas)
-        const { data: activeSeries, error: activeErr } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_COLUMNS).eq('organization_id', organization_id).eq('status', 'ACTIVE')
-        if (activeErr) console.error('topup (lista): leitura das séries', activeErr.code || '')
-        for (const s of (activeSeries || [])) { await topUpForRead(supabase, s, 'lista') }
+        // 03B.3B: leitura PURA — nenhuma ocorrência é gerada aqui. A geração é a ação explícita
+        // POST /recurring-reservations/:id/generate ("Gerar próximas"). A Agenda segue fora do escopo.
         const status = url.searchParams.get('status')
         let q = supabase.from('recurring_reservations').select(RECURRING_SERIES_WITH_RELATIONS).eq('organization_id', organization_id).order('created_at', { ascending: false })
         if (status) q = q.eq('status', status)
@@ -1025,7 +1025,7 @@ async function handleRoute(request, { params }) {
       if (method === 'GET' && id) {
         const { data: series } = await supabase.from('recurring_reservations').select(RECURRING_SERIES_WITH_RELATIONS).eq('id', id).maybeSingle()
         if (!series) return json({ error: 'Mensalista não encontrado' }, 404)
-        await topUpForRead(supabase, series, 'detalhe')
+        // 03B.3B: leitura PURA (sem top-up); gerar datas é ação explícita.
         const nowISO = new Date().toISOString()
         const { data: upcoming } = await supabase.from('reservations').select('id,start_at,end_at,status,is_exception,occurrence_date,court:courts(id,name)').eq('recurring_reservation_id', id).neq('status', 'CANCELLED').gte('start_at', nowISO).order('start_at', { ascending: true }).limit(30)
         return json({ ...series, upcoming: upcoming || [] })
@@ -1313,6 +1313,24 @@ async function handleFinance(request, endpoint, extra, method) {
     return jsonNoStore(r.body, r.status)
   } catch (error) {
     console.error('API financeiro: exceção')
+    return jsonNoStore({ error: 'Erro interno do servidor' }, 500)
+  }
+}
+
+// FASE 03B.3B: /api/recurring-month[/search | /:lineageId[/payments|/customer|/apply-series-price]] —
+// Mensalistas (visão mensal) sobre as RPCs da 03B.3A via lib/reserva/recurring-month-api.js. Sempre com o
+// client da SESSÃO (nunca service-role): o banco decide quem vê e quem recebe. Toda resposta é no-store.
+async function handleRecurringMonth(request, method) {
+  try {
+    const { supabase, user } = await getContext(request)
+    const { searchParams, pathname } = new URL(request.url)
+    const segments = recurringMonthPathSegments(pathname)
+    if (!segments) return jsonNoStore({ error: 'Rota não encontrada' }, 404)
+    const rawBody = method === 'POST' ? await request.text() : null
+    const r = await runRecurringMonthRoute({ method, segments, searchParams, rawBody, user, callRpc: (name, args) => supabase.rpc(name, args) })
+    return jsonNoStore(r.body, r.status)
+  } catch (error) {
+    console.error('API mensalistas: exceção')
     return jsonNoStore({ error: 'Erro interno do servidor' }, 500)
   }
 }

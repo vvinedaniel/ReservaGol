@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { Suspense, useEffect, useState, useCallback, useRef } from 'react'
+import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import { useMe } from '@/components/reserva/dashboard-shell'
 import { isManagerOrAbove } from '@/lib/auth/permissions'
 import { fmtDateTimeLong, isValidDateStr, firstSeriesDate } from '@/lib/reserva/time'
@@ -19,8 +20,9 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sh
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Repeat, Plus, Loader2, Search, Clock, MapPin, User, CalendarClock, AlertTriangle, CheckCircle2, Pause, Play, X, Ban, RefreshCw, ChevronRight } from 'lucide-react'
+import { Repeat, Plus, Loader2, Search, Clock, MapPin, User, CalendarClock, AlertTriangle, CheckCircle2, Pause, Play, X, Ban, RefreshCw, ChevronRight, CalendarRange } from 'lucide-react'
 import { toast } from 'sonner'
+import { MonthView } from '@/components/reserva/mensalistas/month-view'
 
 const WEEKDAYS = ['Domingo', 'Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado']
 const FREQ_LABEL = { WEEKLY: 'Semanal', BIWEEKLY: 'Quinzenal', MONTHLY: 'Mensal' }
@@ -30,8 +32,47 @@ const TABS = [{ k: 'ACTIVE', l: 'Ativos' }, { k: 'PAUSED', l: 'Pausados' }, { k:
 // 03A: dinheiro sempre em centavos inteiros, sem float (lib/reserva/money).
 const centsToBRL = (c) => (c == null ? null : formatCents(c))
 
+// FASE 03B.3B: duas views na mesma página, estado na URL (?view): "Mês" (padrão; components/reserva/mensalistas)
+// e "Séries" (a tela de séries recorrentes original, preservada abaixo com CreateDialog/DetailSheet).
 export default function MensalistasPage() {
+  return (
+    <Suspense fallback={<div className="space-y-3">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}</div>}>
+      <MensalistasRoot />
+    </Suspense>
+  )
+}
+
+const VIEWS = [{ k: 'mes', l: 'Mês' }, { k: 'series', l: 'Séries' }]
+
+function MensalistasRoot() {
   const me = useMe()
+  const router = useRouter()
+  const pathname = usePathname()
+  const sp = useSearchParams()
+  const view = sp.get('view') === 'series' ? 'series' : 'mes'
+  const changeView = (v) => { if (v === view) return; router.push(v === 'series' ? `${pathname}?view=series` : pathname, { scroll: false }) }
+  // "Ver mês" no detalhe da série: abre a view Mês já com o mensalista (linhagem) aberto no mês atual.
+  const openMonth = (seriesId) => router.push(`${pathname}?l=${encodeURIComponent(seriesId)}`, { scroll: false })
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="font-display text-2xl font-bold">Mensalistas</h1>
+          <p className="mt-1 text-sm text-muted-foreground">{view === 'mes' ? 'Jogos, valores e recebimento de cada mensalista no mês.' : 'Reservas recorrentes — configure uma vez e o Reserva Gol cuida das próximas datas.'}</p>
+        </div>
+        <div className="inline-flex rounded-lg border border-border bg-card p-1" role="group" aria-label="Visualização">
+          {VIEWS.map((v) => (
+            <button key={v.k} type="button" aria-pressed={view === v.k} onClick={() => changeView(v.k)}
+              className={`h-11 rounded-md px-4 text-sm font-medium transition-colors sm:h-8 ${view === v.k ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}>{v.l}</button>
+          ))}
+        </div>
+      </div>
+      {view === 'mes' ? <MonthView me={me} /> : <SeriesView me={me} onOpenMonth={openMonth} />}
+    </div>
+  )
+}
+
+function SeriesView({ me, onOpenMonth }) {
   const orgId = me?.activeOrg?.id
   const canManage = isManagerOrAbove(me?.role)
   const [arena, setArena] = useState(null)
@@ -67,13 +108,11 @@ export default function MensalistasPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="font-display text-2xl font-bold">Mensalistas</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Reservas recorrentes — configure uma vez e o Reserva Gol cuida das próximas datas.</p>
+      {canManage && (
+        <div className="flex justify-end">
+          <Button onClick={() => setOpenCreate(true)} disabled={!arena || courts.length === 0}><Plus className="mr-2 h-4 w-4" /> Novo mensalista</Button>
         </div>
-        {canManage && <Button onClick={() => setOpenCreate(true)} disabled={!arena || courts.length === 0}><Plus className="mr-2 h-4 w-4" /> Novo mensalista</Button>}
-      </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-2">
         <div className="inline-flex rounded-lg border border-border bg-card p-1">
@@ -142,7 +181,7 @@ export default function MensalistasPage() {
       )}
 
       {openCreate && arena && <CreateDialog orgId={orgId} arena={arena} courts={courts} onClose={() => setOpenCreate(false)} onCreated={() => { setOpenCreate(false); load() }} />}
-      {detailId && <DetailSheet id={detailId} canManage={canManage} courts={courts} onClose={() => setDetailId(null)} onChanged={load} />}
+      {detailId && <DetailSheet id={detailId} canManage={canManage} courts={courts} onClose={() => setDetailId(null)} onChanged={load} onOpenMonth={onOpenMonth} />}
     </div>
   )
 }
@@ -314,7 +353,7 @@ function CreateDialog({ orgId, arena, courts, onClose, onCreated }) {
 }
 
 // -------------------------------------------------- Detail
-function DetailSheet({ id, canManage, courts, onClose, onChanged }) {
+function DetailSheet({ id, canManage, courts, onClose, onChanged, onOpenMonth }) {
   const [s, setS] = useState(null)
   const [busy, setBusy] = useState(false)
   const [confirm, setConfirm] = useState(null) // {type, ...}
@@ -366,6 +405,14 @@ function DetailSheet({ id, canManage, courts, onClose, onChanged }) {
                 {s.default_price != null && <Row i={<span className="text-xs">R$</span>} v={`${centsToBRL(s.default_price)} por jogo`} />}
                 {s.notes && <p className="pt-1 text-muted-foreground">{s.notes}</p>}
               </div>
+              {onOpenMonth && (
+                <Button size="sm" variant="outline" className="mt-3 h-11 w-full sm:h-9" onClick={() => onOpenMonth(id)}>
+                  <CalendarRange className="mr-1.5 h-3.5 w-3.5" /> Ver mês (jogos e recebimento)
+                </Button>
+              )}
+              {!(s.upcoming || []).length && s.status === 'ACTIVE' && (
+                <p className="mt-2 text-xs text-muted-foreground">Sem próximas datas geradas. {canManage ? 'Use “Gerar próximas”.' : 'Peça ao gestor para gerar as próximas datas.'}</p>
+              )}
             </div>
 
             {canManage && s.status !== 'CANCELLED' && (
