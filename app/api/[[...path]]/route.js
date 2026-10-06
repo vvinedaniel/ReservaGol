@@ -9,6 +9,7 @@ import { PUBLIC_ERRORS, isUuid, isValidSlug, isHHMM, isRealDate, checkPublicDate
 import { CREATE_STATUSES, EDIT_STATUSES } from '@/lib/reserva/status'
 import { PAYMENT_METHODS, PRICE_REASONS, normalizeFinanceNotes, NOTES_MAX_CHARS } from '@/lib/reserva/finance'
 import { runFinanceEndpoint } from '@/lib/reserva/finance-api'
+import { isExpenseEndpoint, financePathSegments, runExpenseRoute } from '@/lib/reserva/expenses-api'
 
 // B1: sem headers CORS — a API só é consumida pelo próprio frontend (mesma origem).
 function json(data, status = 200) {
@@ -1294,12 +1295,21 @@ export const DELETE = handleRoute
 // GET /api/finance/{overview|receivables|cashflow|cash-entries}: camada fina sobre as RPCs rg_fin_*.
 // Sempre com o client da SESSÃO do usuário (nunca service-role): o banco decide quem vê (OWNER/MANAGER)
 // e a que organização/arena o pedido pertence. Toda resposta (inclusive erro) é no-store.
+// FASE 03B.2B: /api/finance/{expense-categories|expense-overview|expenses|expense-payments|cash-result|
+// cash-movements}[/:id[/:acao]] (GET/POST/PATCH) vão para lib/reserva/expenses-api.js, mesmas garantias.
 async function handleFinance(request, endpoint, extra, method) {
-  if (method !== 'GET' || extra !== undefined || !endpoint) return jsonNoStore({ error: 'Rota não encontrada' }, 404)
+  const expense = isExpenseEndpoint(endpoint)
+  if (!expense && (method !== 'GET' || extra !== undefined || !endpoint)) return jsonNoStore({ error: 'Rota não encontrada' }, 404)
   try {
     const { supabase, user } = await getContext(request)
-    const { searchParams } = new URL(request.url)
-    const r = await runFinanceEndpoint({ endpoint, searchParams, user, callRpc: (name, args) => supabase.rpc(name, args) })
+    const { searchParams, pathname } = new URL(request.url)
+    const callRpc = (name, args) => supabase.rpc(name, args)
+    if (expense) {
+      const rawBody = method === 'POST' || method === 'PATCH' ? await request.text() : null
+      const r = await runExpenseRoute({ method, segments: financePathSegments(pathname), searchParams, rawBody, user, callRpc })
+      return jsonNoStore(r.body, r.status)
+    }
+    const r = await runFinanceEndpoint({ endpoint, searchParams, user, callRpc })
     return jsonNoStore(r.body, r.status)
   } catch (error) {
     console.error('API financeiro: exceção')
