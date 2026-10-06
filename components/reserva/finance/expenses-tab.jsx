@@ -41,6 +41,7 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden, arenas = [
   const [openId, setOpenId] = useState(null)
   const lastTrigger = useRef(null)
   const [dialog, setDialog] = useState(null) // 'create' | 'categories'
+  const dialogTrigger = useRef(null) // botão que abriu o diálogo: recebe o foco de volta ao fechar
   const [catsReload, setCatsReload] = useState(0)
 
   // Categorias (inclusive inativas, marcadas) só para o filtro.
@@ -102,6 +103,7 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden, arenas = [
     setStatus(s)
   }
   const openDetail = (id, el) => { lastTrigger.current = el; setOpenId(id) }
+  const openDialog = (kind, ev) => { dialogTrigger.current = ev?.currentTarget || null; setDialog(kind) }
   const closeDetail = () => { seqs.detail.invalidate(); setOpenId(null) }
   const retry = () => setReload((n) => n + 1)
   const reloadCats = () => setCatsReload((n) => n + 1)
@@ -124,8 +126,8 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden, arenas = [
           <p className="text-xs text-muted-foreground">Despesas com vencimento no período selecionado.</p>
         </div>
         <div className="flex w-full gap-2 sm:w-auto">
-          <Button variant="outline" className="h-11 flex-1 sm:h-9 sm:flex-none" disabled={!cats.ready} onClick={() => setDialog('categories')}><Tags className="mr-1.5 h-4 w-4" /> Categorias</Button>
-          <Button className="h-11 flex-1 sm:h-9 sm:flex-none" disabled={!cats.ready} onClick={() => setDialog('create')}><Plus className="mr-1.5 h-4 w-4" /> Nova despesa</Button>
+          <Button variant="outline" className="h-11 flex-1 sm:h-9 sm:flex-none" disabled={!cats.ready} onClick={(ev) => openDialog('categories', ev)}><Tags className="mr-1.5 h-4 w-4" /> Categorias</Button>
+          <Button className="h-11 flex-1 sm:h-9 sm:flex-none" disabled={!cats.ready} onClick={(ev) => openDialog('create', ev)}><Plus className="mr-1.5 h-4 w-4" /> Nova despesa</Button>
         </div>
       </div>
 
@@ -168,10 +170,10 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden, arenas = [
           orgId={scope.orgId} arenas={arenas} categories={cats.list} onChanged={retry} onCategoriesChanged={reloadCats} />
       )}
       {dialog === 'create' && (
-        <ExpenseFormDialog mode="create" api={api} orgId={scope.orgId} arenas={arenas} categories={cats.list} onClose={() => setDialog(null)} onDone={onCreated} onCategoriesChanged={reloadCats} />
+        <ExpenseFormDialog mode="create" api={api} orgId={scope.orgId} arenas={arenas} returnFocusTo={dialogTrigger} categories={cats.list} onClose={() => setDialog(null)} onDone={onCreated} onCategoriesChanged={reloadCats} />
       )}
       {dialog === 'categories' && (
-        <ExpenseCategoriesDialog api={api} orgId={scope.orgId} categories={cats.list} onClose={() => setDialog(null)} onChanged={onCategoryMutated} />
+        <ExpenseCategoriesDialog api={api} orgId={scope.orgId} returnFocusTo={dialogTrigger} categories={cats.list} onClose={() => setDialog(null)} onChanged={onCategoryMutated} />
       )}
     </div>
   )

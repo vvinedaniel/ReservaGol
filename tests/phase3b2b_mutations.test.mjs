@@ -300,7 +300,7 @@ await check('U12 nada fora do client: sem fetch direto, sem service-role; termos
   for (const bad of ['faturamento', 'saldo', 'lucro']) assert.ok(!DETAIL.toLowerCase().includes(bad) && !TAB.toLowerCase().includes(bad), bad)
 })
 await check('U13 entradas de escrita na aba: "Nova despesa" e "Categorias" só com categorias carregadas', () => {
-  assert.ok(TAB.includes("disabled={!cats.ready} onClick={() => setDialog('categories')}") && TAB.includes("disabled={!cats.ready} onClick={() => setDialog('create')}"))
+  assert.ok(TAB.includes("disabled={!cats.ready} onClick={(ev) => openDialog('categories', ev)}") && TAB.includes("disabled={!cats.ready} onClick={(ev) => openDialog('create', ev)}"))
   assert.ok(TAB.includes('Nova despesa') && TAB.includes('Categorias'))
 })
 await check('U14 B-2A.1 intacta: compareKey e dependências do resumo/lista inalteradas', () => {
@@ -399,6 +399,221 @@ await check('H05 categoria recém-criada: rótulo transitório pelo resultado CO
   assert.deepEqual(merge([{ id: CAT, name: 'A', is_active: true }], cc).map((c) => c.id), [CAT, CAT2])
   assert.deepEqual(merge([{ id: CAT, name: 'A', is_active: true }, { id: CAT2, name: 'Nova', is_active: true }], cc).map((c) => c.id), [CAT, CAT2])
   assert.deepEqual(merge([{ id: CAT, name: 'A', is_active: true }], { ...cc, is_active: false }).map((c) => c.id), [CAT], 'inativa nunca entra na criação')
+})
+
+// ------------------------------------------------------------------ 03B.2B-2B.2 — categoria inline (B1) e foco (B2)
+// B1: executa o código REAL do formulário (onSuccess da criação inline, effect de 2ª fase, selectable,
+// set, pendingCategoryReady), extraído da fonte, contra um modelo do Select do Radix 2.2.5: a opção
+// nativa entra por useLayoutEffect (vale no commit SEGUINTE); o <select> nativo, num effect passivo,
+// aplica o valor novo e, se a opção ainda não existe, normaliza para '' e devolve '' ao onValueChange.
+// Lote de atualizações = um commit (como o React 18 agrupa o onSuccess inteiro).
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+const NEWCAT = '3c1d2e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f'
+const BASE_CATS = [{ id: CAT, name: 'Energia', is_active: true }, { id: CAT2, name: 'Antiga', is_active: false }]
+
+function formParts(src) {
+  const form = /export function ExpenseFormDialog[\s\S]*?\n\}\n/.exec(src)[0]
+  const ready = /export function pendingCategoryReady\(pendingId, selectable\) \{\n([\s\S]*?)\n\}\n/.exec(src)
+  const selectable = /\n  const selectable = (.+)\n/.exec(form)
+  const hasPending = /\n  const selectableHasPending = (.+)\n/.exec(form)
+  const set = /\n  const set = \(k, v\) => (\{.*\})\n/.exec(form)
+  const effect = /\n  useEffect\(\(\) => \{\n([\s\S]*?)\n  \}, \[([^\]]*)\]\)\n/.exec(form)
+  const onSuccess = /async function createCategory\(\)[\s\S]*?onSuccess: async \(res\) => \{\n([\s\S]*?)\n      \},\n      onError/.exec(form)
+  assert.ok(selectable && set && onSuccess, 'partes essenciais do formulário encontradas')
+  return { ready: ready?.[1], selectable: selectable[1], hasPending: hasPending?.[1], set: set[1], effect: effect && { body: effect[1], deps: effect[2].split(',').map((x) => x.trim()).filter(Boolean) }, onSuccess: onSuccess[1] }
+}
+
+async function runInlineCategory(src, { rpc = { category_id: NEWCAT, name: 'Limpeza', is_active: true, created: true }, reloadAdds = true } = {}) {
+  const P = formParts(src)
+  const ready = P.ready ? new Function('pendingId', 'selectable', P.ready) : () => false
+  const selectableOf = new Function('confirmedCat', 'options', `return ${P.selectable}`)
+  const hasPendingOf = P.hasPending ? new Function('pendingCategoryReady', 'pendingCategoryId', 'selectable', `return ${P.hasPending}`) : () => false
+  let state = { f: { description: 'Conta', category_id: '', arena_id: '', amount: '10,00', due_date: '2026-10-06', notes: 'n' }, errors: { category_id: 'Escolha a categoria.' }, confirmedCat: null, pendingCategoryId: null, newCat: { name: 'Limpeza' }, categories: BASE_CATS }
+  const queue = []
+  const trace = { phase: 'idle', resets: 0, setCalls: [], intentResets: 0, commits: [] }
+  const intent = { current: { reset: () => { trace.intentResets += 1 } } }
+  const setRaw = new Function('intent', 'setErrors', 'setF', `return (k, v) => ${P.set}`)(intent, (fn) => queue.push((s) => ({ ...s, errors: fn(s.errors) })), (fn) => queue.push((s) => ({ ...s, f: fn(s.f) })))
+  const set = (k, v) => { trace.setCalls.push({ phase: trace.phase, k, v }); setRaw(k, v) }
+  const setConfirmedCat = (v) => queue.push((s) => ({ ...s, confirmedCat: v }))
+  const setPendingCategoryId = (v) => queue.push((s) => ({ ...s, pendingCategoryId: v }))
+  const setNewCat = (v) => queue.push((s) => ({ ...s, newCat: typeof v === 'function' ? v(s.newCat) : v }))
+  let effect = null
+  if (P.effect) {
+    for (const dep of P.effect.deps) assert.ok(['pendingCategoryId', 'selectableHasPending'].includes(dep), `dependência inesperada do effect: ${dep}`)
+    effect = { fn: new Function('set', 'setPendingCategoryId', 'pendingCategoryId', 'selectableHasPending', P.effect.body), deps: P.effect.deps }
+  }
+  let native = new Set(); let nativeQueued = null; let prevValue; let prevDeps = null
+  function commit() {
+    let remount = false
+    if (nativeQueued) { native = nativeQueued; nativeQueued = null; remount = true } // key do <select> muda => remonta
+    for (const u of queue.splice(0)) state = u(state)
+    const selectable = selectableOf(state.confirmedCat, categoryOptions(state.categories, null))
+    const ids = selectable.map((c) => c.id)
+    const value = state.f.category_id || undefined
+    const selectableHasPending = hasPendingOf(ready, state.pendingCategoryId, selectable)
+    trace.commits.push({ ids, value, native: [...native] })
+    if (ids.length !== native.size || ids.some((id) => !native.has(id))) nativeQueued = new Set(ids) // layout effect das opções
+    trace.phase = 'bubble' // effect passivo do <select> nativo (filho roda antes do pai)
+    if (!remount && value !== prevValue && value !== undefined && !native.has(value)) { trace.resets += 1; set('category_id', '') }
+    prevValue = value
+    trace.phase = 'effect'
+    if (effect) {
+      const scope = { pendingCategoryId: state.pendingCategoryId, selectableHasPending }
+      const deps = effect.deps.map((d) => scope[d])
+      if (!prevDeps || deps.some((d, i) => !Object.is(d, prevDeps[i]))) { prevDeps = deps; effect.fn(set, setPendingCategoryId, state.pendingCategoryId, selectableHasPending) }
+    }
+    trace.phase = 'idle'
+  }
+  const settle = () => { let n = 0; while (queue.length || nativeQueued) { commit(); assert.ok(++n < 12, 'loop de renders/effects') } }
+  commit(); settle() // diálogo aberto com as categorias atuais
+  let reloadRequested = false
+  trace.phase = 'onSuccess'
+  const onSuccess = new AsyncFunction('res', 'toast', 'successMessage', 'setConfirmedCat', 'setPendingCategoryId', 'onCategoriesChanged', 'set', 'setNewCat', P.onSuccess)
+  await onSuccess({ data: rpc }, { success: () => {} }, successMessage, setConfirmedCat, setPendingCategoryId, () => { reloadRequested = true }, set, setNewCat)
+  trace.phase = 'idle'
+  const rpcCommit = trace.commits.length
+  settle()
+  if (reloadRequested && reloadAdds) { queue.push((s) => ({ ...s, categories: [...s.categories, { id: rpc.category_id, name: rpc.name, is_active: rpc.is_active }] })); settle() }
+  return { state, trace, rpcCommit }
+}
+
+function assertTwoPhase(r, label = '') {
+  const { state, trace, rpcCommit } = r
+  assert.ok(!trace.setCalls.some((c) => c.phase === 'onSuccess' && c.k === 'category_id'), `${label}category_id definido dentro do onSuccess`)
+  assert.equal(trace.resets, 0, `${label}o <select> nativo normalizou o valor para vazio`)
+  assert.equal(state.f.category_id, NEWCAT, `${label}categoria criada não ficou selecionada`)
+  const opt = trace.commits.findIndex((c, i) => i >= rpcCommit && c.ids.includes(NEWCAT))
+  const sel = trace.commits.findIndex((c) => c.value === NEWCAT)
+  assert.ok(opt >= rpcCommit && sel > opt, `${label}ordem: RPC (${rpcCommit}) -> opção selecionável (${opt}) -> seleção (${sel})`)
+  assert.ok(trace.commits[sel].native.includes(NEWCAT), `${label}opção nativa presente quando o valor muda`)
+}
+
+await check('I01 B1 duas fases: RPC confirma -> opção entra no conjunto selecionável -> só então category_id é aplicado', async () => {
+  const r = await runInlineCategory(FORMS)
+  assertTwoPhase(r)
+  const applied = r.trace.setCalls.filter((c) => c.k === 'category_id')
+  assert.deepEqual(applied.map((c) => [c.phase, c.v]), [['effect', NEWCAT]], 'aplicado uma única vez, pelo effect de 2ª fase')
+  assert.ok(r.trace.intentResets >= 1, 'formulário mudou => nova intenção')
+  assert.equal(r.state.errors.category_id, undefined, 'erro de categoria limpo')
+  assert.deepEqual({ ...r.state.f, category_id: '' }, { description: 'Conta', category_id: '', arena_id: '', amount: '10,00', due_date: '2026-10-06', notes: 'n' }, 'nenhum outro campo alterado')
+  assert.equal(r.state.pendingCategoryId, null, 'pendente limpo'); assert.equal(r.state.newCat, null, 'área inline fechada')
+  assert.ok(r.trace.commits.length < 10, 'sem loop de effects')
+  // categoria já existente devolvida pela RPC (created=false, ativa): mesma seleção em duas fases
+  assertTwoPhase(await runInlineCategory(FORMS, { rpc: { category_id: NEWCAT, name: 'Limpeza', is_active: true, created: false } }), 'existente: ')
+  // lista recarregada ainda sem a categoria: o rótulo confirmado pela RPC basta
+  assertTwoPhase(await runInlineCategory(FORMS, { reloadAdds: false }), 'sem reload: ')
+})
+await check('I02 B1 mutações: cada parte da correção é necessária (o modelo reproduz o bug do Preview)', async () => {
+  const mutate = (from, to) => { assert.ok(FORMS.includes(from), `trecho para mutação não encontrado: ${from.slice(0, 50)}`); return FORMS.replace(from, to) }
+  const PHASE1 = 'if (c?.category_id && c.is_active === true) setPendingCategoryId(c.category_id)'
+  const EFFECT = /\n  useEffect\(\(\) => \{\n[\s\S]*?\n  \}, \[[^\]]*\]\)\n/.exec(FORMS)[0]
+  const fails = async (src, why) => { const r = await runInlineCategory(src); assert.throws(() => assertTwoPhase(r), undefined, why) }
+  // código anterior (03B.2B-2B.1): seleção dentro do onSuccess, no mesmo lote em que a opção entra => ''
+  await fails(mutate(PHASE1 + '\n        await onCategoriesChanged?.()', "if (c?.category_id) setPendingCategoryId(c.category_id)\n        await onCategoriesChanged?.()\n        if (c?.category_id) set('category_id', c.category_id)"), 'category_id de volta ao onSuccess')
+  const oldOnly = mutate(EFFECT, '\n').replace(PHASE1, "if (c?.category_id) set('category_id', c.category_id)")
+  const rOld = await runInlineCategory(oldOnly)
+  assert.equal(rOld.state.f.category_id, '', 'modelo reproduz o bug: valor volta para vazio'); assert.ok(rOld.trace.resets >= 1)
+  await fails(mutate(EFFECT, '\n'), 'effect de 2ª fase removido')
+  // presença na lista é condição: sem confirmedCat, o effect precisa esperar a lista recarregada
+  const noConfirmed = mutate('if (c?.category_id) setConfirmedCat({ id: c.category_id, name: c.name, is_active: c.is_active === true })', '')
+  assertTwoPhase(await runInlineCategory(noConfirmed), 'sem rótulo transitório, espera o reload: ')
+  const readyBody = /export function pendingCategoryReady\(pendingId, selectable\) \{\n([\s\S]*?)\n\}\n/.exec(FORMS)[1]
+  await fails(noConfirmed.replace(readyBody, '  return !!pendingId'), 'seleção antes de a opção existir')
+})
+await check('I03 B1 categoria inativa nunca é selecionada pelo fallback', async () => {
+  const readyBody = /export function pendingCategoryReady\(pendingId, selectable\) \{\n([\s\S]*?)\n\}\n/.exec(FORMS)[1]
+  const ready = new Function('pendingId', 'selectable', readyBody)
+  assert.equal(ready(NEWCAT, [{ id: NEWCAT, name: 'X', is_active: true }]), true)
+  assert.equal(ready(NEWCAT, [{ id: NEWCAT, name: 'X', is_active: false }]), false, 'inativa na lista')
+  assert.equal(ready(NEWCAT, [{ id: CAT, name: 'Energia', is_active: true }]), false, 'ausente')
+  assert.equal(ready(null, [{ id: CAT, name: 'Energia', is_active: true }]), false, 'nada pendente')
+  // RPC devolvendo categoria inativa: nada é selecionado, nem antes nem depois do reload
+  const r = await runInlineCategory(FORMS, { rpc: { category_id: NEWCAT, name: 'Velha', is_active: false, created: false } })
+  assert.equal(r.state.f.category_id, ''); assert.ok(!r.trace.setCalls.some((c) => c.k === 'category_id' && c.v === NEWCAT))
+  // mutação: fallback aceitando inativa (rótulo transitório + checagem de ativa removidos) => selecionaria
+  const loose = FORMS.replace(readyBody, '  return !!pendingId && selectable.some((c) => c.id === pendingId)')
+    .replace('confirmedCat && confirmedCat.is_active && !options', 'confirmedCat && !options')
+    .replace('if (c?.category_id && c.is_active === true) setPendingCategoryId', 'if (c?.category_id) setPendingCategoryId')
+  assert.notEqual(loose, FORMS)
+  const rl = await runInlineCategory(loose, { rpc: { category_id: NEWCAT, name: 'Velha', is_active: false, created: false } })
+  assert.equal(rl.state.f.category_id, NEWCAT, 'a mutação é detectável: inativa seria selecionada')
+})
+await check('I04 B1 componente: Fase 1 no onSuccess, Fase 2 em useEffect por primitivas; sem setTimeout; confirmedCat só da RPC', () => {
+  const form = /export function ExpenseFormDialog[\s\S]*?\n\}\n/.exec(FORMS)[0]
+  const ok = /async function createCategory\(\)[\s\S]*?onSuccess: async \(res\) => \{\n([\s\S]*?)\n      \},/.exec(form)[1]
+  assert.ok(!/set\('category_id'|setF\(/.test(ok), 'onSuccess não mexe no formulário')
+  assert.ok(ok.indexOf('setPendingCategoryId(c.category_id)') > ok.indexOf('setConfirmedCat('), 'pendente registrado depois da categoria confirmada')
+  assert.ok(form.includes('const selectableHasPending = pendingCategoryReady(pendingCategoryId, selectable)'))
+  assert.ok(form.includes('}, [pendingCategoryId, selectableHasPending])'), 'effect depende só das primitivas')
+  assert.ok(!/setTimeout|requestAnimationFrame|queueMicrotask/.test(form), 'sem temporizador')
+  assert.equal((form.match(/setConfirmedCat\(/g) || []).length, 1, 'confirmedCat vem só da resposta da RPC')
+})
+
+// B2: foco devolvido ao botão que abriu cada diálogo (função REAL executada com elementos falsos).
+function fakeEl({ connected = true, disabled = false, dialog = null } = {}) {
+  return { isConnected: connected, disabled, focused: 0, focus() { this.focused += 1 }, closest: (sel) => (sel === '[role="dialog"]' ? dialog : null) }
+}
+function fakeEvt() { return { prevented: false, preventDefault() { this.prevented = true } } }
+const focusReturnSrc = /export function focusReturn\(ref\) \{\n([\s\S]*?)\n\}\n/.exec(FORMS)
+await check('J01 B2 focusReturn: botão montado recebe o foco; desmontado => padrão; desabilitado => diálogo pai', () => {
+  assert.ok(focusReturnSrc, 'focusReturn exportado de expense-forms')
+  const focusReturn = new Function('ref', focusReturnSrc[1])
+  const btn = fakeEl(); let e = fakeEvt(); focusReturn({ current: btn })(e)
+  assert.equal(btn.focused, 1); assert.equal(e.prevented, true)
+  const gone = fakeEl({ connected: false }); e = fakeEvt(); focusReturn({ current: gone })(e)
+  assert.equal(gone.focused, 0); assert.equal(e.prevented, false, 'não impede o padrão do Radix')
+  e = fakeEvt(); focusReturn({ current: null })(e); assert.equal(e.prevented, false)
+  e = fakeEvt(); focusReturn(undefined)(e); assert.equal(e.prevented, false, 'sem ref (ex.: aberto pelo toast)')
+  const sheet = fakeEl(); const busyBtn = fakeEl({ disabled: true, dialog: sheet }); e = fakeEvt(); focusReturn({ current: busyBtn })(e)
+  assert.equal(busyBtn.focused, 0); assert.equal(sheet.focused, 1); assert.equal(e.prevented, true)
+  const lone = fakeEl({ disabled: true }); e = fakeEvt(); focusReturn({ current: lone })(e); assert.equal(e.prevented, false)
+})
+await check('J02 B2 todos os diálogos de Despesas restauram o foco; componentes UI globais intocados', () => {
+  for (const [f, code, n] of [['forms', FORMS, 3], ['categorias', CATS, 1]]) {
+    const contents = code.match(/<(Alert)?DialogContent\b[^>]*>/g) || []
+    assert.equal(contents.length, n, f)
+    for (const c of contents) assert.ok(c.includes('onCloseAutoFocus={focusReturn(returnFocusTo)}'), `${f}: ${c.slice(0, 70)}`)
+  }
+  for (const fn of ['ExpenseFormDialog', 'EntryDialog', 'ReasonDialog']) assert.ok(new RegExp(`export function ${fn}\\(\\{[^}]*returnFocusTo \\}\\)`).test(FORMS), fn)
+  assert.ok(CATS.includes("import { focusReturn } from '@/components/reserva/finance/expense-forms'") && /ExpenseCategoriesDialog\(\{[^}]*returnFocusTo \}\)/.test(CATS))
+  for (const ui of ['components/ui/dialog.jsx', 'components/ui/alert-dialog.jsx', 'components/ui/sheet.jsx']) assert.ok(!/returnFocusTo|focusReturn/.test(read(ui)), ui)
+})
+await check('J03 B2 aba: "Nova despesa" e "Categorias" guardam o botão real (currentTarget) e o passam aos diálogos', () => {
+  const m = /const openDialog = (\(kind, ev\) => \{[^}]*\})/.exec(TAB)
+  assert.ok(m, 'openDialog na aba')
+  const ref = { current: 'antigo' }; const opened = []
+  const openDialog = new Function('dialogTrigger', 'setDialog', `return ${m[1]}`)(ref, (k) => opened.push(k))
+  const btn = fakeEl(); openDialog('create', { currentTarget: btn })
+  assert.equal(ref.current, btn); assert.deepEqual(opened, ['create'])
+  openDialog('categories', undefined); assert.equal(ref.current, null, 'sem evento não reaproveita botão antigo')
+  assert.ok(TAB.includes('const dialogTrigger = useRef(null)'))
+  assert.ok(TAB.includes('<ExpenseFormDialog mode="create" api={api} orgId={scope.orgId} arenas={arenas} returnFocusTo={dialogTrigger} categories={cats.list}'))
+  assert.ok(TAB.includes('<ExpenseCategoriesDialog api={api} orgId={scope.orgId} returnFocusTo={dialogTrigger} categories={cats.list}'))
+})
+await check('J04 B2 detalhe: Editar/Pagamento/Devolução/Anular/Cancelar guardam o botão de origem; Sheet mantém a restauração para a linha', () => {
+  const m = /const openDlg = (\(next, ev\) => \{[^}]*\})/.exec(DETAIL)
+  assert.ok(m, 'openDlg no detalhe')
+  const ref = { current: null }; const dlgs = []
+  const openDlg = new Function('dlgTrigger', 'setDlg', `return ${m[1]}`)(ref, (d) => dlgs.push(d))
+  const btn = fakeEl(); openDlg({ type: 'void', entry: { payment_id: PAY } }, { currentTarget: btn })
+  assert.equal(ref.current, btn); assert.deepEqual(dlgs, [{ type: 'void', entry: { payment_id: PAY } }])
+  for (const h of ["onEdit={(ev) => openDlg({ type: 'edit' }, ev)}", "onPay={(ev) => openDlg({ type: 'payment' }, ev)}", "onCancel={(ev) => openDlg({ type: 'cancel' }, ev)}",
+    "onReverse={(e, ev) => openDlg({ type: 'reverse', entry: e }, ev)}", "onVoid={(e, ev) => openDlg({ type: 'void', entry: e }, ev)}", 'onClick={(ev) => onReverse(e, ev)}', 'onClick={(ev) => onVoid(e, ev)}'])
+    assert.ok(DETAIL.includes(h), h)
+  assert.ok(DETAIL.includes('onClick={onPay}') && DETAIL.includes('onClick={onEdit}') && DETAIL.includes('onClick={onCancel}'), 'botões de ação repassam o evento')
+  const children = DETAIL.match(/<(ExpenseFormDialog|EntryDialog|ReasonDialog) [\s\S]*?\/>/g) || []
+  assert.equal(children.length, 5)
+  for (const c of children) assert.ok(c.includes('returnFocusTo={dlgTrigger}'), c.slice(0, 60))
+  assert.ok(DETAIL.includes('onCloseAutoFocus={(e) => { const el = returnFocusTo?.current; if (el && el.isConnected) { e.preventDefault(); el.focus() } }}'), 'Sheet inalterado')
+})
+await check('J05 foco inicial: nome da nova categoria (autoFocus) e motivo do AlertDialog (autoFocus + onOpenAutoFocus local)', () => {
+  assert.ok(/<Input id="exp-new-category"[^>]*\bautoFocus\b/.test(FORMS), 'nova categoria')
+  const rd = /export function ReasonDialog[\s\S]*?\n\}\n/.exec(FORMS)[0]
+  assert.ok(/<Textarea id=\{id\} ref=\{reasonRef\} autoFocus\b/.test(rd), 'motivo')
+  assert.ok(rd.includes('onOpenAutoFocus={(e) => { if (reasonRef.current) { e.preventDefault(); reasonRef.current.focus() } }}'))
+  const handler = new Function('reasonRef', 'return (e) => { if (reasonRef.current) { e.preventDefault(); reasonRef.current.focus() } }')
+  const ta = fakeEl(); const e = fakeEvt(); handler({ current: ta })(e); assert.equal(ta.focused, 1); assert.equal(e.prevented, true)
+  const e2 = fakeEvt(); handler({ current: null })(e2); assert.equal(e2.prevented, false)
 })
 
 // ------------------------------------------------------------------ resultado

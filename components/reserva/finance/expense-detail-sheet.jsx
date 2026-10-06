@@ -7,7 +7,9 @@
 // Cancelar despesa e, por lançamento, Registrar devolução / Anular lançamento. Os formulários ficam em
 // expense-forms.jsx. Depois de cada mutação (ou de recusa por estado), o detalhe é recarregado em
 // segundo plano e a aba é avisada (onChanged) — nada otimista.
-import { useEffect, useState } from 'react'
+// 03B.2B-2B.2: o diálogo filho devolve o foco ao botão que o abriu (dlgTrigger); o Sheet continua
+// devolvendo o foco à linha da lista (returnFocusTo).
+import { useEffect, useRef, useState } from 'react'
 import { runLatest } from '@/lib/reserva/latest-request'
 import { expenseBadges, fmtDueDate, deriveExpenseActions } from '@/lib/reserva/expenses'
 import { formatCents } from '@/lib/reserva/money'
@@ -29,6 +31,8 @@ export function ExpenseDetailSheet({ expenseId, api, seq, onClose, onForbidden, 
   const [st, setSt] = useState({ loading: true, error: false, data: null })
   const [reload, setReload] = useState(0)
   const [dlg, setDlg] = useState(null)
+  const dlgTrigger = useRef(null)
+  const openDlg = (next, ev) => { dlgTrigger.current = ev?.currentTarget || null; setDlg(next) }
 
   useEffect(() => {
     runLatest(seq, () => api.detail(expenseId), {
@@ -75,17 +79,17 @@ export function ExpenseDetailSheet({ expenseId, api, seq, onClose, onForbidden, 
                 <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" /> Atualizando…
               </p>
             )}
-            <ExpenseActions a={a} busy={st.loading} onEdit={() => setDlg({ type: 'edit' })} onPay={() => setDlg({ type: 'payment' })} onCancel={() => setDlg({ type: 'cancel' })} />
-            <ExpenseDetailBody d={d} a={a} busy={st.loading} onReverse={(e) => setDlg({ type: 'reverse', entry: e })} onVoid={(e) => setDlg({ type: 'void', entry: e })} />
+            <ExpenseActions a={a} busy={st.loading} onEdit={(ev) => openDlg({ type: 'edit' }, ev)} onPay={(ev) => openDlg({ type: 'payment' }, ev)} onCancel={(ev) => openDlg({ type: 'cancel' }, ev)} />
+            <ExpenseDetailBody d={d} a={a} busy={st.loading} onReverse={(e, ev) => openDlg({ type: 'reverse', entry: e }, ev)} onVoid={(e, ev) => openDlg({ type: 'void', entry: e }, ev)} />
           </div>
         )}
         {d && dlg?.type === 'edit' && (
-          <ExpenseFormDialog mode="edit" api={api} orgId={orgId} arenas={arenas} categories={categories} detail={d} onClose={() => setDlg(null)} onDone={done} onCategoriesChanged={onCategoriesChanged} />
+          <ExpenseFormDialog mode="edit" api={api} orgId={orgId} arenas={arenas} categories={categories} detail={d} returnFocusTo={dlgTrigger} onClose={() => setDlg(null)} onDone={done} onCategoriesChanged={onCategoriesChanged} />
         )}
-        {d && dlg?.type === 'payment' && <EntryDialog kind="payment" api={api} expense={d} onClose={() => setDlg(null)} onDone={done} />}
-        {d && dlg?.type === 'reverse' && <EntryDialog kind="reverse" api={api} expense={d} entry={dlg.entry} onClose={() => setDlg(null)} onDone={done} />}
-        {d && dlg?.type === 'void' && <ReasonDialog kind="void" api={api} expense={d} entry={dlg.entry} onClose={() => setDlg(null)} onDone={done} />}
-        {d && dlg?.type === 'cancel' && <ReasonDialog kind="cancel" api={api} expense={d} onClose={() => setDlg(null)} onDone={done} />}
+        {d && dlg?.type === 'payment' && <EntryDialog kind="payment" api={api} expense={d} returnFocusTo={dlgTrigger} onClose={() => setDlg(null)} onDone={done} />}
+        {d && dlg?.type === 'reverse' && <EntryDialog kind="reverse" api={api} expense={d} entry={dlg.entry} returnFocusTo={dlgTrigger} onClose={() => setDlg(null)} onDone={done} />}
+        {d && dlg?.type === 'void' && <ReasonDialog kind="void" api={api} expense={d} entry={dlg.entry} returnFocusTo={dlgTrigger} onClose={() => setDlg(null)} onDone={done} />}
+        {d && dlg?.type === 'cancel' && <ReasonDialog kind="cancel" api={api} expense={d} returnFocusTo={dlgTrigger} onClose={() => setDlg(null)} onDone={done} />}
       </SheetContent>
     </Sheet>
   )
@@ -158,9 +162,9 @@ function ExpenseDetailBody({ d, a, busy, onReverse, onVoid }) {
                   {e.voided_at && <p className="text-muted-foreground">Anulado em {fmtDateTimeLong(e.voided_at)}{e.void_reason ? ` · Motivo: ${e.void_reason}` : ''}</p>}
                   {(e.canReverse || e.canVoid || e.voidBlocked) && (
                     <div className="mt-2 flex flex-wrap gap-1.5">
-                      {e.canReverse && <Button size="sm" variant="outline" className="h-11 sm:h-8" disabled={busy} onClick={() => onReverse(e)}><Undo2 className="mr-1 h-3.5 w-3.5" /> Registrar devolução</Button>}
+                      {e.canReverse && <Button size="sm" variant="outline" className="h-11 sm:h-8" disabled={busy} onClick={(ev) => onReverse(e, ev)}><Undo2 className="mr-1 h-3.5 w-3.5" /> Registrar devolução</Button>}
                       {(e.canVoid || e.voidBlocked) && (
-                        <Button size="sm" variant="ghost" className="h-11 hover:text-destructive sm:h-8" disabled={busy || !e.canVoid} onClick={() => onVoid(e)}
+                        <Button size="sm" variant="ghost" className="h-11 hover:text-destructive sm:h-8" disabled={busy || !e.canVoid} onClick={(ev) => onVoid(e, ev)}
                           aria-describedby={e.voidBlocked ? `void-blocked-${e.payment_id}` : undefined}><Ban className="mr-1 h-3.5 w-3.5" /> Anular lançamento</Button>
                       )}
                       {e.voidBlocked === 'HAS_REVERSALS' && <p id={`void-blocked-${e.payment_id}`} className="w-full text-muted-foreground">Anule primeiro as devoluções deste pagamento.</p>}

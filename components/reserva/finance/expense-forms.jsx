@@ -10,7 +10,9 @@
 // - 403 numa mutação vira só mensagem (não derruba a página; isso é só para leituras).
 // 03B.2B-2B.1: estado visual via submitWithBusy (2ª invocação nunca libera o busy da 1ª); criação inline
 // de categoria trava o diálogo; CATEGORY_INACTIVE concorrente recarrega categorias sem trocar a escolha.
-import { useRef, useState } from 'react'
+// 03B.2B-2B.2: categoria criada inline selecionada em duas fases (pendingCategoryReady); foco devolvido
+// ao botão que abriu cada diálogo (focusReturn); motivo recebe o foco inicial no AlertDialog.
+import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
   validateExpenseDraft, buildExpenseChanges, validateEntryDraft, validateReason, validateCategoryName, categoryOptions,
@@ -45,6 +47,28 @@ function Field({ id, label, error, hint, children }) {
 }
 const describedBy = (id, error, hint) => (error ? `${id}-error` : hint ? `${id}-hint` : undefined)
 
+// Devolve o foco ao botão que abriu o diálogo (onCloseAutoFocus). Sem DialogTrigger, o Radix mandaria o
+// foco para o body. Botão desmontado: comportamento padrão; botão desabilitado (detalhe recarregando
+// depois da mutação): foco no diálogo pai que o contém.
+export function focusReturn(ref) {
+  return (e) => {
+    const el = ref?.current
+    if (!el || !el.isConnected) return
+    const target = el.disabled ? el.closest('[role="dialog"]') : el
+    if (!target) return
+    e.preventDefault()
+    target.focus()
+  }
+}
+
+// Categoria criada inline: o Select (Radix) mantém um <select> nativo interno. Se o valor controlado
+// mudar no MESMO render em que a opção nova entra, o nativo ainda não tem a opção, normaliza para '' e
+// devolve '' ao onValueChange. Fase 1 (sucesso da RPC): guarda a categoria confirmada e o id pendente.
+// Fase 2 (effect): aplica o id só quando a opção ATIVA já está no conjunto selecionável renderizado.
+export function pendingCategoryReady(pendingId, selectable) {
+  return !!pendingId && selectable.some((c) => c.id === pendingId && c.is_active === true)
+}
+
 // busy = ESTA mutação está em voo (spinner); disabled = qualquer mutação concorrente (sem spinner).
 function SubmitButton({ busy, disabled = busy, children, variant }) {
   return (
@@ -55,7 +79,7 @@ function SubmitButton({ busy, disabled = busy, children, variant }) {
 }
 
 // ------------------------------------------------------------------ criar / editar despesa
-export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = [], detail = null, onClose, onDone, onCategoriesChanged }) {
+export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = [], detail = null, onClose, onDone, onCategoriesChanged, returnFocusTo }) {
   const editing = mode === 'edit'
   const [f, setF] = useState(() => (editing
     ? { description: detail.description || '', category_id: detail.category_id || '', arena_id: detail.arena_id || '', amount: centsToInput(detail.amount), due_date: detail.due_date || '', notes: detail.notes || '' }
@@ -65,6 +89,7 @@ export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = 
   const [newCat, setNewCat] = useState(null)
   // Categoria criada aqui e JÁ CONFIRMADA pela RPC: rótulo transitório até a lista recarregada chegar.
   const [confirmedCat, setConfirmedCat] = useState(null)
+  const [pendingCategoryId, setPendingCategoryId] = useState(null)
   const intent = useRef(null)
   if (!intent.current) intent.current = createOperationIntent()
   const guard = useRef(null)
@@ -79,6 +104,13 @@ export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = 
   const selectable = confirmedCat && confirmedCat.is_active && !options.some((c) => c.id === confirmedCat.id) ? [...options, confirmedCat] : options
   // Qualquer campo alterado = nova intenção (descarta o operation_id da anterior).
   const set = (k, v) => { intent.current.reset(); setErrors((e) => ({ ...e, [k]: undefined })); setF((s) => ({ ...s, [k]: v })) }
+  // Fase 2 da categoria inline: a opção já foi renderizada; só agora o valor controlado muda.
+  const selectableHasPending = pendingCategoryReady(pendingCategoryId, selectable)
+  useEffect(() => {
+    if (!selectableHasPending) return
+    set('category_id', pendingCategoryId)
+    setPendingCategoryId(null)
+  }, [pendingCategoryId, selectableHasPending])
   // Categoria inativada por outra sessão: recarrega as categorias, mantém a escolha e a intenção.
   const onSaveError = (err) => {
     toast.error(mutationErrorMessage(err))
@@ -126,8 +158,8 @@ export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = 
         toast.success(successMessage('category-create', res.data))
         const c = res.data
         if (c?.category_id) setConfirmedCat({ id: c.category_id, name: c.name, is_active: c.is_active === true })
+        if (c?.category_id && c.is_active === true) setPendingCategoryId(c.category_id)
         await onCategoriesChanged?.()
-        if (c?.category_id) set('category_id', c.category_id)
         setNewCat(null)
       },
       onError: (err) => setNewCat((s) => (s ? { ...s, error: mutationErrorMessage(err) } : s)),
@@ -136,7 +168,7 @@ export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = 
 
   return (
     <Dialog open onOpenChange={(o) => { if (!o && !locked) onClose() }}>
-      <DialogContent className={DIALOG_CLASS}>
+      <DialogContent className={DIALOG_CLASS} onCloseAutoFocus={focusReturn(returnFocusTo)}>
         <DialogHeader>
           <DialogTitle>{editing ? 'Editar despesa' : 'Nova despesa'}</DialogTitle>
           <DialogDescription>{editing ? 'Altere os dados da despesa. Valor e arena ficam bloqueados depois de um pagamento.' : 'Registre uma despesa a pagar. Pagamentos são registrados depois, no detalhe da despesa.'}</DialogDescription>
@@ -153,7 +185,7 @@ export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = 
             </Select>
             {newCat ? (
               <div className="flex flex-wrap items-start gap-2 pt-1">
-                <Input id="exp-new-category" aria-label="Nome da nova categoria" className="h-11 min-w-0 flex-1 sm:h-9" value={newCat.name || ''} maxLength={60}
+                <Input id="exp-new-category" aria-label="Nome da nova categoria" className="h-11 min-w-0 flex-1 sm:h-9" value={newCat.name || ''} maxLength={60} autoFocus
                   onChange={(e) => setNewCat((s) => ({ ...s, name: e.target.value, error: null }))} aria-invalid={!!newCat.error} aria-describedby={newCat.error ? 'exp-new-category-error' : undefined} />
                 <Button type="button" variant="outline" className="h-11 sm:h-9" disabled={locked} onClick={createCategory}>
                   {categoryBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" />}Criar
@@ -201,7 +233,7 @@ export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = 
 // ------------------------------------------------------------------ pagamento / devolução
 // kind 'payment': até o valor a pagar da despesa. kind 'reverse': a partir de UM pagamento, até o
 // disponível dele (valor − já devolvido). Data/hora padrão fixada ao abrir (faz parte da intenção).
-export function EntryDialog({ kind, api, expense, entry = null, onClose, onDone }) {
+export function EntryDialog({ kind, api, expense, entry = null, onClose, onDone, returnFocusTo }) {
   const reverse = kind === 'reverse'
   const max = reverse ? reversibleOf(entry) : (toCents(expense.amount_due) ?? 0)
   const [f, setF] = useState(() => ({ amount: centsToInput(max), method: reverse ? entry.method : 'PIX', at: nowLocalInput(), notes: '' }))
@@ -231,7 +263,7 @@ export function EntryDialog({ kind, api, expense, entry = null, onClose, onDone 
   const id = reverse ? 'rev' : 'pay'
   return (
     <Dialog open onOpenChange={(o) => { if (!o && !busy) onClose() }}>
-      <DialogContent className={DIALOG_CLASS}>
+      <DialogContent className={DIALOG_CLASS} onCloseAutoFocus={focusReturn(returnFocusTo)}>
         <DialogHeader>
           <DialogTitle>{reverse ? 'Registrar devolução' : 'Registrar pagamento'}</DialogTitle>
           <DialogDescription>
@@ -281,8 +313,9 @@ export function EntryDialog({ kind, api, expense, entry = null, onClose, onDone 
 // ------------------------------------------------------------------ anular lançamento / cancelar despesa
 // Confirmação explícita (AlertDialog) com motivo obrigatório. Sem operation_id: o banco já é
 // idempotente (changed=false quando já estava anulado/cancelado).
-export function ReasonDialog({ kind, api, expense, entry = null, onClose, onDone }) {
+export function ReasonDialog({ kind, api, expense, entry = null, onClose, onDone, returnFocusTo }) {
   const isVoid = kind === 'void'
+  const reasonRef = useRef(null)
   const [reason, setReason] = useState('')
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -306,7 +339,8 @@ export function ReasonDialog({ kind, api, expense, entry = null, onClose, onDone
   const id = isVoid ? 'void-reason' : 'cancel-reason'
   return (
     <AlertDialog open onOpenChange={(o) => { if (!o && !busy) onClose() }}>
-      <AlertDialogContent className={DIALOG_CLASS}>
+      <AlertDialogContent className={DIALOG_CLASS} onCloseAutoFocus={focusReturn(returnFocusTo)}
+        onOpenAutoFocus={(e) => { if (reasonRef.current) { e.preventDefault(); reasonRef.current.focus() } }}>
         <AlertDialogHeader>
           <AlertDialogTitle>{isVoid ? 'Anular lançamento' : 'Cancelar despesa'}</AlertDialogTitle>
           <AlertDialogDescription>
@@ -317,7 +351,7 @@ export function ReasonDialog({ kind, api, expense, entry = null, onClose, onDone
         </AlertDialogHeader>
         <form onSubmit={submit} className="space-y-3" noValidate>
           <Field id={id} label="Motivo" error={error}>
-            <Textarea id={id} rows={2} maxLength={500} value={reason} onChange={(e) => { setReason(e.target.value); setError(null) }}
+            <Textarea id={id} ref={reasonRef} autoFocus rows={2} maxLength={500} value={reason} onChange={(e) => { setReason(e.target.value); setError(null) }}
               placeholder={isVoid ? 'Ex.: valor digitado errado' : 'Ex.: lançada em duplicidade'} aria-invalid={!!error} aria-describedby={describedBy(id, error)} />
           </Field>
           <AlertDialogFooter className="gap-2">

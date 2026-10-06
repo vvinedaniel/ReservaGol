@@ -4,9 +4,11 @@
 // Sem exclusão física (o banco não oferece). Categoria inativa some da criação de despesas, continua
 // nas despesas antigas e pode ser reativada. Lista vem da aba (rg_expense_categories com inativas);
 // depois de cada mutação a aba recarrega a lista (onChanged) — nada otimista.
+// 03B.2B-2B.2: ao fechar, o foco volta ao botão "Categorias" (returnFocusTo).
 import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { validateCategoryName } from '@/lib/reserva/expenses'
+import { focusReturn } from '@/components/reserva/finance/expense-forms'
 import { createSubmitGuard, submitWithBusy, mutationErrorMessage, successMessage } from '@/lib/reserva/expense-mutation'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
@@ -15,7 +17,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Loader2, Plus } from 'lucide-react'
 
-export function ExpenseCategoriesDialog({ api, orgId, categories = [], onClose, onChanged }) {
+export function ExpenseCategoriesDialog({ api, orgId, categories = [], onClose, onChanged, returnFocusTo }) {
   const [name, setName] = useState('')
   const [createError, setCreateError] = useState(null)
   const [editing, setEditing] = useState(null) // { id, name, error }
@@ -55,7 +57,7 @@ export function ExpenseCategoriesDialog({ api, orgId, categories = [], onClose, 
 
   return (
     <Dialog open onOpenChange={(o) => { if (!o && !busy) onClose() }}>
-      <DialogContent className="max-h-[90dvh] overflow-y-auto motion-reduce:animate-none motion-reduce:transition-none">
+      <DialogContent className="max-h-[90dvh] overflow-y-auto motion-reduce:animate-none motion-reduce:transition-none" onCloseAutoFocus={focusReturn(returnFocusTo)}>
         <DialogHeader>
           <DialogTitle>Categorias de despesa</DialogTitle>
           <DialogDescription>Crie, renomeie ou inative categorias. Categoria inativa não aparece em novas despesas, continua nas despesas antigas e pode ser reativada.</DialogDescription>
