@@ -8,13 +8,15 @@
 // - um envio por vez (createSubmitGuard: guarda síncrona contra duplo clique) + botão desabilitado.
 // - nenhuma atualização otimista: quem abriu recarrega as fontes depois do sucesso (onDone).
 // - 403 numa mutação vira só mensagem (não derruba a página; isso é só para leituras).
+// 03B.2B-2B.1: estado visual via submitWithBusy (2ª invocação nunca libera o busy da 1ª); criação inline
+// de categoria trava o diálogo; CATEGORY_INACTIVE concorrente recarrega categorias sem trocar a escolha.
 import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
   validateExpenseDraft, buildExpenseChanges, validateEntryDraft, validateReason, validateCategoryName, categoryOptions,
   createOperationIntent, reversibleOf, fmtDueDate,
 } from '@/lib/reserva/expenses'
-import { createSubmitGuard, submitIntent, mutationErrorMessage, shouldReloadAfterError, successMessage } from '@/lib/reserva/expense-mutation'
+import { createSubmitGuard, submitWithBusy, mutationErrorMessage, shouldReloadAfterError, categoryReloadNeeded, successMessage } from '@/lib/reserva/expense-mutation'
 import { formatCents, centsToInput, toCents } from '@/lib/reserva/money'
 import { PAYMENT_METHODS, PAYMENT_METHOD_LABELS, nowLocalInput } from '@/lib/reserva/finance'
 import { todayStr, fmtDateTimeLong } from '@/lib/reserva/time'
@@ -43,9 +45,10 @@ function Field({ id, label, error, hint, children }) {
 }
 const describedBy = (id, error, hint) => (error ? `${id}-error` : hint ? `${id}-hint` : undefined)
 
-function SubmitButton({ busy, children, variant }) {
+// busy = ESTA mutação está em voo (spinner); disabled = qualquer mutação concorrente (sem spinner).
+function SubmitButton({ busy, disabled = busy, children, variant }) {
   return (
-    <Button type="submit" variant={variant} className="h-11 sm:h-9" disabled={busy}>
+    <Button type="submit" variant={variant} className="h-11 sm:h-9" disabled={disabled}>
       {busy && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" />}{children}
     </Button>
   )
@@ -60,6 +63,8 @@ export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = 
   const [errors, setErrors] = useState({})
   const [busy, setBusy] = useState(false)
   const [newCat, setNewCat] = useState(null)
+  // Categoria criada aqui e JÁ CONFIRMADA pela RPC: rótulo transitório até a lista recarregada chegar.
+  const [confirmedCat, setConfirmedCat] = useState(null)
   const intent = useRef(null)
   if (!intent.current) intent.current = createOperationIntent()
   const guard = useRef(null)
@@ -67,57 +72,70 @@ export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = 
 
   const amountLocked = editing && detail.amount_locked === true
   const arenaLocked = editing && detail.arena_locked === true
+  // Criação inline de categoria em voo também trava o diálogo (mesma guarda; sem spinner na despesa).
+  const categoryBusy = newCat?.busy === true
+  const locked = busy || categoryBusy
   const options = categoryOptions(categories, editing ? detail.category_id : null)
+  const selectable = confirmedCat && confirmedCat.is_active && !options.some((c) => c.id === confirmedCat.id) ? [...options, confirmedCat] : options
   // Qualquer campo alterado = nova intenção (descarta o operation_id da anterior).
   const set = (k, v) => { intent.current.reset(); setErrors((e) => ({ ...e, [k]: undefined })); setF((s) => ({ ...s, [k]: v })) }
+  // Categoria inativada por outra sessão: recarrega as categorias, mantém a escolha e a intenção.
+  const onSaveError = (err) => {
+    toast.error(mutationErrorMessage(err))
+    if (categoryReloadNeeded(err)) onCategoriesChanged?.()
+    if (editing && shouldReloadAfterError(err)) onDone({ kind: 'reload', keepOpen: true })
+  }
 
   async function submit(e) {
     e.preventDefault()
+    if (locked || guard.current.busy) return
     const r = validateExpenseDraft(f)
     if (!r.ok) { setErrors(r.errors); return }
     if (editing) {
       const changes = buildExpenseChanges(detail, r.value)
       if (Object.keys(changes).length === 0) { toast.info('Nada a alterar'); onClose(); return }
-      setBusy(true)
-      await submitIntent({
+      await submitWithBusy({
         guard: guard.current,
+        setBusy,
         send: () => api.updateExpense(detail.expense_id, changes),
         onSuccess: async (res) => { toast.success(successMessage('update', res.data)); await onDone({ kind: 'update' }) },
-        onError: (err) => { toast.error(mutationErrorMessage(err)); if (shouldReloadAfterError(err)) onDone({ kind: 'reload', keepOpen: true }) },
+        onError: onSaveError,
       })
-      setBusy(false)
       return
     }
-    setBusy(true)
-    await submitIntent({
+    await submitWithBusy({
       guard: guard.current,
+      setBusy,
       intent: intent.current,
       send: (op) => api.createExpense(op, orgId, r.value),
       onSuccess: async (res) => { await onDone({ kind: 'create', expenseId: res.data?.expense_id, idempotent: res.data?.idempotent === true }) },
-      onError: (err) => toast.error(mutationErrorMessage(err)),
+      onError: onSaveError,
     })
-    setBusy(false)
   }
 
   async function createCategory() {
+    if (guard.current.busy) return
     const v = validateCategoryName(newCat?.name)
     if (!v.ok) { setNewCat((s) => ({ ...s, error: v.error })); return }
-    setNewCat((s) => ({ ...s, busy: true, error: null }))
-    await submitIntent({
+    setNewCat((s) => ({ ...s, error: null }))
+    await submitWithBusy({
       guard: guard.current,
+      setBusy: (b) => setNewCat((s) => (s ? { ...s, busy: b } : s)),
       send: () => api.createCategory(orgId, v.value),
       onSuccess: async (res) => {
         toast.success(successMessage('category-create', res.data))
+        const c = res.data
+        if (c?.category_id) setConfirmedCat({ id: c.category_id, name: c.name, is_active: c.is_active === true })
         await onCategoriesChanged?.()
-        if (res.data?.category_id) set('category_id', res.data.category_id)
+        if (c?.category_id) set('category_id', c.category_id)
         setNewCat(null)
       },
-      onError: (err) => setNewCat((s) => ({ ...s, busy: false, error: mutationErrorMessage(err) })),
+      onError: (err) => setNewCat((s) => (s ? { ...s, error: mutationErrorMessage(err) } : s)),
     })
   }
 
   return (
-    <Dialog open onOpenChange={(o) => { if (!o && !busy) onClose() }}>
+    <Dialog open onOpenChange={(o) => { if (!o && !locked) onClose() }}>
       <DialogContent className={DIALOG_CLASS}>
         <DialogHeader>
           <DialogTitle>{editing ? 'Editar despesa' : 'Nova despesa'}</DialogTitle>
@@ -131,20 +149,20 @@ export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = 
           <Field id="exp-category" label="Categoria" error={errors.category_id}>
             <Select value={f.category_id || undefined} onValueChange={(v) => set('category_id', v)}>
               <SelectTrigger id="exp-category" className="h-11 sm:h-9" aria-invalid={!!errors.category_id} aria-describedby={describedBy('exp-category', errors.category_id)}><SelectValue placeholder="Escolha a categoria" /></SelectTrigger>
-              <SelectContent>{options.map((c) => <SelectItem key={c.id} value={c.id}>{c.is_active ? c.name : `${c.name} (inativa)`}</SelectItem>)}</SelectContent>
+              <SelectContent>{selectable.map((c) => <SelectItem key={c.id} value={c.id}>{c.is_active ? c.name : `${c.name} (inativa)`}</SelectItem>)}</SelectContent>
             </Select>
             {newCat ? (
               <div className="flex flex-wrap items-start gap-2 pt-1">
                 <Input id="exp-new-category" aria-label="Nome da nova categoria" className="h-11 min-w-0 flex-1 sm:h-9" value={newCat.name || ''} maxLength={60}
                   onChange={(e) => setNewCat((s) => ({ ...s, name: e.target.value, error: null }))} aria-invalid={!!newCat.error} aria-describedby={newCat.error ? 'exp-new-category-error' : undefined} />
-                <Button type="button" variant="outline" className="h-11 sm:h-9" disabled={newCat.busy} onClick={createCategory}>
-                  {newCat.busy && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" />}Criar
+                <Button type="button" variant="outline" className="h-11 sm:h-9" disabled={locked} onClick={createCategory}>
+                  {categoryBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" />}Criar
                 </Button>
-                <Button type="button" variant="ghost" className="h-11 sm:h-9" onClick={() => setNewCat(null)}>Cancelar</Button>
+                <Button type="button" variant="ghost" className="h-11 sm:h-9" disabled={categoryBusy} onClick={() => setNewCat(null)}>Cancelar</Button>
                 {newCat.error && <p id="exp-new-category-error" className="w-full text-xs text-amber-500" role="alert">{newCat.error}</p>}
               </div>
             ) : (
-              <Button type="button" variant="ghost" className="h-11 px-2 sm:h-8" onClick={() => setNewCat({ name: '' })}><Plus className="mr-1 h-4 w-4" /> Nova categoria</Button>
+              <Button type="button" variant="ghost" className="h-11 px-2 sm:h-8" disabled={locked} onClick={() => setNewCat({ name: '' })}><Plus className="mr-1 h-4 w-4" /> Nova categoria</Button>
             )}
           </Field>
           <Field id="exp-arena" label="Arena" error={errors.arena_id} hint={arenaLocked ? 'Bloqueada: a despesa já tem pagamento.' : 'Geral = despesa da organização, sem arena.'}>
@@ -171,8 +189,8 @@ export function ExpenseFormDialog({ mode, api, orgId, arenas = [], categories = 
               aria-invalid={!!errors.notes} aria-describedby={describedBy('exp-notes', errors.notes)} />
           </Field>
           <DialogFooter className="gap-2">
-            <Button type="button" variant="ghost" className="h-11 sm:h-9" onClick={onClose} disabled={busy}>Cancelar</Button>
-            <SubmitButton busy={busy}>{editing ? 'Salvar' : 'Registrar despesa'}</SubmitButton>
+            <Button type="button" variant="ghost" className="h-11 sm:h-9" onClick={onClose} disabled={locked}>Cancelar</Button>
+            <SubmitButton busy={busy} disabled={locked}>{editing ? 'Salvar' : 'Registrar despesa'}</SubmitButton>
           </DialogFooter>
         </form>
       </DialogContent>
@@ -197,17 +215,17 @@ export function EntryDialog({ kind, api, expense, entry = null, onClose, onDone 
 
   async function submit(e) {
     e.preventDefault()
+    if (guard.current.busy) return
     const r = validateEntryDraft(f, { maxCents: max })
     if (!r.ok) { setErrors(r.errors); return }
-    setBusy(true)
-    await submitIntent({
+    await submitWithBusy({
       guard: guard.current,
+      setBusy,
       intent: intent.current,
       send: (op) => (reverse ? api.reversePayment(op, entry.payment_id, r.value) : api.registerPayment(op, expense.expense_id, r.value)),
       onSuccess: async (res) => { toast.success(successMessage(kind, res.data)); await onDone() },
       onError: (err) => { toast.error(mutationErrorMessage(err)); if (shouldReloadAfterError(err)) onDone({ keepOpen: true }) },
     })
-    setBusy(false)
   }
 
   const id = reverse ? 'rev' : 'pay'
@@ -273,16 +291,16 @@ export function ReasonDialog({ kind, api, expense, entry = null, onClose, onDone
 
   async function submit(e) {
     e.preventDefault()
+    if (guard.current.busy) return
     const r = validateReason(reason)
     if (!r.ok) { setError(r.error); return }
-    setBusy(true)
-    await submitIntent({
+    await submitWithBusy({
       guard: guard.current,
+      setBusy,
       send: () => (isVoid ? api.voidPayment(entry.payment_id, r.value) : api.cancelExpense(expense.expense_id, r.value)),
       onSuccess: async (res) => { toast.success(successMessage(kind, res.data)); await onDone() },
       onError: (err) => { toast.error(mutationErrorMessage(err)); if (shouldReloadAfterError(err)) onDone({ keepOpen: true }) },
     })
-    setBusy(false)
   }
 
   const id = isVoid ? 'void-reason' : 'cancel-reason'

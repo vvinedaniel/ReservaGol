@@ -105,6 +105,9 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden, arenas = [
   const closeDetail = () => { seqs.detail.invalidate(); setOpenId(null) }
   const retry = () => setReload((n) => n + 1)
   const reloadCats = () => setCatsReload((n) => n + 1)
+  // Gerenciador de categorias (renomear / inativar / reativar / criar): a lista e o resumo também
+  // recarregam, porque rg_expenses devolve category_name. Nada é alterado localmente.
+  const onCategoryMutated = () => { reloadCats(); retry() }
   // Despesa criada: fecha o formulário, recarrega lista/resumo e oferece abrir a despesa criada.
   const onCreated = async ({ expenseId, idempotent }) => {
     setDialog(null)
@@ -168,7 +171,7 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden, arenas = [
         <ExpenseFormDialog mode="create" api={api} orgId={scope.orgId} arenas={arenas} categories={cats.list} onClose={() => setDialog(null)} onDone={onCreated} onCategoriesChanged={reloadCats} />
       )}
       {dialog === 'categories' && (
-        <ExpenseCategoriesDialog api={api} orgId={scope.orgId} categories={cats.list} onClose={() => setDialog(null)} onChanged={reloadCats} />
+        <ExpenseCategoriesDialog api={api} orgId={scope.orgId} categories={cats.list} onClose={() => setDialog(null)} onChanged={onCategoryMutated} />
       )}
     </div>
   )

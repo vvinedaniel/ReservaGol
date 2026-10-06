@@ -7,7 +7,7 @@
 // ações pelo estado real, mobile 44 px, acessibilidade, termos proibidos).
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import { createSubmitGuard, submitIntent, mutationErrorMessage, shouldReloadAfterError, successMessage } from '../lib/reserva/expense-mutation.js'
+import { createSubmitGuard, submitIntent, submitWithBusy, categoryReloadNeeded, mutationErrorMessage, shouldReloadAfterError, successMessage } from '../lib/reserva/expense-mutation.js'
 import { createExpensesApi, ExpenseRequestError, ExpenseNetworkError } from '../lib/reserva/expenses-client.js'
 import { runExpenseRoute, financePathSegments, EXPENSE_HINT_MSG } from '../lib/reserva/expenses-api.js'
 import { createOperationIntent, validateExpenseDraft, buildExpenseChanges, validateEntryDraft, validateReason, validateCategoryName, deriveExpenseActions, categoryOptions } from '../lib/reserva/expenses.js'
@@ -194,7 +194,7 @@ await check('F07 recusa do banco por estado (ex.: AMOUNT_LOCKED / OVER_BALANCE) 
   const br2 = bridge(() => ({ data: null, error: { code: 'RGP03', hint: 'OVER_BALANCE' } }))
   const e2 = await br2.api.registerPayment('8f3e4c0a-3f5d-4e77-9c99-2d0a4f6e8b32', EXP, { method: 'PIX', amount: 1, at: '2026-10-03T11:00:00-03:00', notes: null }).catch((x) => x)
   assert.equal(e2.code, 'FINANCE_LIMIT'); assert.equal(mutationErrorMessage(e2), EXPENSE_HINT_MSG.OVER_BALANCE)
-  for (const f of [FORMS]) assert.ok((f.match(/if \(shouldReloadAfterError\(err\)\) onDone\(\{[^}]*keepOpen: true \}\)/g) || []).length >= 3, 'recarrega mantendo o formulário aberto')
+  for (const f of [FORMS]) assert.ok((f.match(/if \((editing && )?shouldReloadAfterError\(err\)\) onDone\(\{[^}]*keepOpen: true \}\)/g) || []).length >= 3, 'recarrega mantendo o formulário aberto')
 })
 
 // ------------------------------------------------------------------ componentes
@@ -234,8 +234,10 @@ await check('U04 envio único: toda mutação via submitIntent + guarda; botão 
     }
     assert.ok(code.includes('guard: guard.current'), `${f}: guarda`)
   }
-  assert.ok(FORMS.includes('<Button type="submit" variant={variant} className="h-11 sm:h-9" disabled={busy}>'))
-  assert.equal((FORMS.match(/onOpenChange=\{\(o\) => \{ if \(!o && !busy\) onClose\(\) \}\}/g) || []).length, 3)
+  // 2B.1: spinner (busy) separado de desabilitado (qualquer mutação concorrente)
+  assert.ok(FORMS.includes('function SubmitButton({ busy, disabled = busy, children, variant })') && FORMS.includes('<Button type="submit" variant={variant} className="h-11 sm:h-9" disabled={disabled}>'))
+  assert.equal((FORMS.match(/onOpenChange=\{\(o\) => \{ if \(!o && !busy\) onClose\(\) \}\}/g) || []).length, 2, 'lançamento + motivo')
+  assert.equal((FORMS.match(/onOpenChange=\{\(o\) => \{ if \(!o && !locked\) onClose\(\) \}\}/g) || []).length, 1, 'despesa: travado também pela categoria inline')
   assert.ok(CATS.includes('onOpenChange={(o) => { if (!o && !busy) onClose() }}'))
 })
 await check('U05 403 numa mutação não derruba a página (só mensagem): formulários não usam onForbidden', () => {
@@ -304,6 +306,99 @@ await check('U13 entradas de escrita na aba: "Nova despesa" e "Categorias" só c
 await check('U14 B-2A.1 intacta: compareKey e dependências do resumo/lista inalteradas', () => {
   assert.ok(TAB.includes("const compareKey = `${scope.period.compare?.from || ''}|${scope.period.compare?.to || ''}`"))
   assert.ok(TAB.includes('}, [baseKey, compareKey, categoryId, reload])') && TAB.includes('}, [baseKey, categoryId, status, reload])'))
+})
+
+// ------------------------------------------------------------------ 03B.2B-2B.1 — estado das mutações
+await check('H01 categoria renomeada/inativada/reativada: callback da aba recarrega categorias E lista/resumo; nada otimista', async () => {
+  // callback REAL da aba, avaliado com contadores (reloadCats / retry)
+  const m = /const onCategoryMutated = (\(\) => \{[^}]*\})/.exec(TAB)
+  assert.ok(m, 'onCategoryMutated na aba')
+  const counts = { cats: 0, list: 0 }
+  const onCategoryMutated = new Function('reloadCats', 'retry', `return ${m[1]}`)(() => { counts.cats += 1 }, () => { counts.list += 1 })
+  assert.ok(TAB.includes('categories={cats.list} onClose={() => setDialog(null)} onChanged={onCategoryMutated} />'), 'gerenciador usa o callback completo')
+  assert.ok(TAB.includes('onDone={onCreated} onCategoriesChanged={reloadCats} />'), 'criação inline (formulário) recarrega só categorias')
+  // fluxo do gerenciador: rename confirmado pela rota real -> onSuccess -> onChanged
+  const b = bridge(ok({ category_id: CAT, name: 'Faxina', is_active: true, changed: true }))
+  const items = [{ id: CAT, name: 'Limpeza', is_active: true }]
+  const snapshot = JSON.stringify(items)
+  let busyState = null
+  const out = await submitWithBusy({ guard: createSubmitGuard(), setBusy: (x) => { busyState = x }, send: () => b.api.updateCategory(CAT, { name: 'Faxina' }), onSuccess: async () => { onCategoryMutated() } })
+  assert.equal(out, 'ok'); assert.deepEqual(b.rpcCalls[0], ['rg_expense_category_update', { p_category_id: CAT, p_changes: { name: 'Faxina' } }])
+  assert.deepEqual(counts, { cats: 1, list: 1 }, 'recarrega categorias e lista/resumo')
+  assert.equal(JSON.stringify(items), snapshot, 'nenhum item alterado localmente'); assert.equal(busyState, false)
+  assert.ok(!/categories\.(push|splice)|\.name\s*=\s|setCats\(/.test(CATS), 'gerenciador não mexe na lista localmente')
+})
+await check('H02 busy x guarda: B invocada durante A não toca no busy; A segue pendente; só o fim de A libera', async () => {
+  const guard = createSubmitGuard(); const history = []; const setBusy = (x) => history.push(x)
+  const d = deferred(); let calls = 0
+  const A = submitWithBusy({ guard, setBusy, send: () => { calls += 1; return d.p } })
+  assert.deepEqual(history, [true]); assert.equal(guard.busy, true)
+  const B = await submitWithBusy({ guard, setBusy, send: () => { calls += 1; return Promise.resolve({}) } })
+  assert.equal(B, 'busy'); assert.deepEqual(history, [true], 'B não alterou o estado visual'); assert.equal(guard.busy, true, 'A continua pendente')
+  d.resolve({ status: 200, data: {} }); assert.equal(await A, 'ok')
+  assert.deepEqual(history, [true, false], 'busy liberado só quando A terminou'); assert.equal(calls, 1)
+  // erro também libera (finally), e uma nova operação depois funciona
+  const e = await submitWithBusy({ guard, setBusy, send: async () => { throw new ExpenseNetworkError() } })
+  assert.equal(e, 'error'); assert.deepEqual(history.slice(-2), [true, false])
+  // todos os handlers checam a guarda ANTES de mudar estado visual e usam submitWithBusy (sem setBusy manual)
+  for (const [f, code, n] of [['forms', FORMS, 4], ['categorias', CATS, 3]]) {
+    assert.ok((code.match(/if \((locked \|\| )?guard\.current\.busy\) return/g) || []).length >= n, `${f}: checagem da guarda nos handlers`)
+    assert.ok(!/submitIntent\(|setBusy\(true\)|setBusy\(false\)/.test(code), `${f}: sem alternância manual de busy`)
+    assert.ok(code.includes('submitWithBusy({'), f)
+  }
+})
+await check('H03 criação inline de categoria trava o diálogo da despesa (sem spinner falso na despesa)', async () => {
+  const form = /export function ExpenseFormDialog[\s\S]*?\n\}\n/.exec(FORMS)[0]
+  assert.ok(form.includes('const categoryBusy = newCat?.busy === true') && form.includes('const locked = busy || categoryBusy'))
+  assert.ok(form.includes('<Dialog open onOpenChange={(o) => { if (!o && !locked) onClose() }}>'), 'não fecha')
+  assert.ok(form.includes('if (locked || guard.current.busy) return'), 'não submete a despesa')
+  assert.ok(form.includes('onClick={onClose} disabled={locked}>Cancelar</Button>'), 'não cancela o formulário')
+  assert.ok(form.includes('disabled={categoryBusy} onClick={() => setNewCat(null)}>Cancelar</Button>'), 'não esconde a área da nova categoria')
+  assert.ok(form.includes('<SubmitButton busy={busy} disabled={locked}>'), 'spinner só da despesa; desabilitado por qualquer mutação')
+  assert.ok(form.includes('setBusy: (b) => setNewCat((s) => (s ? { ...s, busy: b } : s)),'), 'busy da categoria pelo submitWithBusy')
+  // modelo: enquanto a categoria está em voo, a despesa não pode ser enviada (mesma guarda)
+  const guard = createSubmitGuard(); const d = deferred(); let cat = { busy: false }
+  const p = submitWithBusy({ guard, setBusy: (b) => { cat = { ...cat, busy: b } }, send: () => d.p })
+  const locked = () => cat.busy === true
+  assert.equal(locked(), true)
+  assert.equal(await submitWithBusy({ guard, setBusy: () => { throw new Error('não deveria marcar busy da despesa') }, send: async () => ({}) }), 'busy')
+  d.resolve({ data: { category_id: CAT2, name: 'Nova', is_active: true } }); await p
+  assert.equal(locked(), false)
+})
+await check('H04 CATEGORY_INACTIVE concorrente: mensagem, formulário aberto, recarrega categorias, mantém escolha e intenção', async () => {
+  const inactive = new ExpenseRequestError(409, { error: EXPENSE_HINT_MSG.CATEGORY_INACTIVE, code: 'FINANCE_STATE', reason: 'CATEGORY_INACTIVE' })
+  assert.equal(categoryReloadNeeded(inactive), true)
+  for (const e of [new ExpenseRequestError(409, { code: 'FINANCE_STATE', reason: 'AMOUNT_LOCKED' }), new ExpenseRequestError(409, { reason: 'CATEGORY_INACTIVE_EXISTS' }),
+    new ExpenseRequestError(409, { code: 'FINANCE_LIMIT', reason: 'OVER_BALANCE' }), new ExpenseRequestError(400, { reason: 'CATEGORY_INACTIVE' }), new ExpenseNetworkError()])
+    assert.equal(categoryReloadNeeded(e), false, `${e.status} ${e.reason}`)
+  // fluxo de criação: rota real responde RGP01/CATEGORY_INACTIVE
+  const b = bridge(() => ({ data: null, error: { code: 'RGP01', hint: 'CATEGORY_INACTIVE' } }))
+  const v = validateExpenseDraft({ description: 'Luz', category_id: CAT, amount: '10,00', due_date: '2026-10-10' }).value
+  const intent = createOperationIntent(); const guard = createSubmitGuard()
+  let catsReloads = 0, closed = false; const msgs = []; const keys = []
+  const onSaveError = (err) => { msgs.push(mutationErrorMessage(err)); if (categoryReloadNeeded(err)) catsReloads += 1 }
+  const attempt = () => submitWithBusy({ guard, setBusy: () => {}, intent, send: (op) => { keys.push(op); return b.api.createExpense(op, ORG, v) }, onSuccess: () => { closed = true }, onError: onSaveError })
+  assert.equal(await attempt(), 'error'); assert.equal(await attempt(), 'error')
+  assert.deepEqual(msgs, [EXPENSE_HINT_MSG.CATEGORY_INACTIVE, EXPENSE_HINT_MSG.CATEGORY_INACTIVE])
+  assert.equal(catsReloads, 2); assert.equal(closed, false, 'formulário aberto')
+  assert.equal(keys[0], keys[1], 'sem nova intenção até o usuário alterar algum campo'); assert.equal(b.rpcCalls[0][1].p_category, CAT, 'categoria não trocada')
+  // componente: a mesma rotina de erro em criar E editar; edição mantém a recarga do detalhe
+  const form = /export function ExpenseFormDialog[\s\S]*?\n\}\n/.exec(FORMS)[0]
+  assert.ok(form.includes('if (categoryReloadNeeded(err)) onCategoriesChanged?.()') && form.includes("if (editing && shouldReloadAfterError(err)) onDone({ kind: 'reload', keepOpen: true })"))
+  assert.equal((form.match(/onError: onSaveError,/g) || []).length, 2, 'criar e editar')
+  assert.ok(!/set\('category_id'/.test(form.slice(form.indexOf('const onSaveError'), form.indexOf('async function submit'))), 'não troca a categoria')
+})
+await check('H05 categoria recém-criada: rótulo transitório pelo resultado CONFIRMADO da RPC até a lista recarregar', () => {
+  const form = /export function ExpenseFormDialog[\s\S]*?\n\}\n/.exec(FORMS)[0]
+  assert.ok(form.includes("if (c?.category_id) setConfirmedCat({ id: c.category_id, name: c.name, is_active: c.is_active === true })"))
+  assert.ok(form.includes('const selectable = confirmedCat && confirmedCat.is_active && !options.some((c) => c.id === confirmedCat.id) ? [...options, confirmedCat] : options'))
+  assert.ok(form.includes('{selectable.map((c) => <SelectItem key={c.id} value={c.id}>'))
+  // mesma regra, aplicada: antes do reload aparece; depois do reload não duplica
+  const merge = (options, cc) => (cc && cc.is_active && !options.some((c) => c.id === cc.id) ? [...options, cc] : options)
+  const cc = { id: CAT2, name: 'Nova', is_active: true }
+  assert.deepEqual(merge([{ id: CAT, name: 'A', is_active: true }], cc).map((c) => c.id), [CAT, CAT2])
+  assert.deepEqual(merge([{ id: CAT, name: 'A', is_active: true }, { id: CAT2, name: 'Nova', is_active: true }], cc).map((c) => c.id), [CAT, CAT2])
+  assert.deepEqual(merge([{ id: CAT, name: 'A', is_active: true }], { ...cc, is_active: false }).map((c) => c.id), [CAT], 'inativa nunca entra na criação')
 })
 
 // ------------------------------------------------------------------ resultado

@@ -7,7 +7,7 @@
 import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { validateCategoryName } from '@/lib/reserva/expenses'
-import { createSubmitGuard, submitIntent, mutationErrorMessage, successMessage } from '@/lib/reserva/expense-mutation'
+import { createSubmitGuard, submitWithBusy, mutationErrorMessage, successMessage } from '@/lib/reserva/expense-mutation'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -23,33 +23,35 @@ export function ExpenseCategoriesDialog({ api, orgId, categories = [], onClose, 
   const guard = useRef(null)
   if (!guard.current) guard.current = createSubmitGuard()
 
-  async function run(tag, send, kind, after) {
-    setBusy(tag)
-    const out = await submitIntent({
+  // Guarda = autoridade síncrona; uma 2ª invocação durante o envio não toca no estado visual.
+  // onChanged (da aba) recarrega categorias E lista/resumo: rg_expenses devolve category_name.
+  function run(tag, send, kind, after) {
+    return submitWithBusy({
       guard: guard.current,
+      setBusy: (b) => setBusy(b ? tag : null),
       send,
       onSuccess: async (res) => { toast.success(successMessage(kind, res.data)); after?.(); await onChanged() },
       onError: (err) => { const msg = mutationErrorMessage(err); if (tag === 'create') setCreateError(msg); else if (tag.startsWith('rename:')) setEditing((s) => (s ? { ...s, error: msg } : s)); else toast.error(msg) },
     })
-    setBusy(null)
-    return out
   }
 
   function create(e) {
     e.preventDefault()
+    if (guard.current.busy) return
     const v = validateCategoryName(name)
     if (!v.ok) { setCreateError(v.error); return }
     run('create', () => api.createCategory(orgId, v.value), 'category-create', () => { setName(''); setCreateError(null) })
   }
   function rename(e) {
     e.preventDefault()
+    if (guard.current.busy) return
     const v = validateCategoryName(editing?.name)
     if (!v.ok) { setEditing((s) => ({ ...s, error: v.error })); return }
     const current = categories.find((c) => c.id === editing.id)
     if (current && current.name === v.value) { setEditing(null); return }
     run(`rename:${editing.id}`, () => api.updateCategory(editing.id, { name: v.value }), 'category-update', () => setEditing(null))
   }
-  const toggle = (c) => run(`toggle:${c.id}`, () => api.updateCategory(c.id, { is_active: !c.is_active }), 'category-update')
+  const toggle = (c) => { if (guard.current.busy) return; run(`toggle:${c.id}`, () => api.updateCategory(c.id, { is_active: !c.is_active }), 'category-update') }
 
   return (
     <Dialog open onOpenChange={(o) => { if (!o && !busy) onClose() }}>
