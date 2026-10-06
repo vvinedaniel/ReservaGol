@@ -44,7 +44,10 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden }) {
     return () => seqs.cats.invalidate()
   }, [scope.orgId])
 
-  // Cards: período/arena/categoria (status não se aplica ao resumo).
+  // Cards: período/arena/categoria + período de comparação (status não se aplica ao resumo). baseKey só
+  // tem from/to; a comparação pode mudar com o mesmo from/to (ex.: atalho -> personalizado), então
+  // entra como chave própria (string, não o objeto scope, para não recarregar por identidade).
+  const compareKey = `${scope.period.compare?.from || ''}|${scope.period.compare?.to || ''}`
   useEffect(() => {
     runLatest(seqs.overview, () => api.overview(scope, { categoryId }), {
       onStart: () => setOv((s) => ({ loading: true, error: false, data: s.data })),
@@ -52,7 +55,7 @@ export function ExpensesTab({ api, seqs, scope, baseKey, onForbidden }) {
       onError: (e) => { if (e?.status === 403) onForbidden(); setOv({ loading: false, error: true, data: null }) },
     })
     return () => seqs.overview.invalidate()
-  }, [baseKey, categoryId, reload])
+  }, [baseKey, compareKey, categoryId, reload])
 
   // Lista: nova carga principal invalida qualquer "carregar mais" pendente e zera a paginação.
   // Conteúdo anterior pode ficar visível (marcado como atualizando) até a resposta nova.

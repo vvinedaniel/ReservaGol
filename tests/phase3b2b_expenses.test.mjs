@@ -24,6 +24,7 @@ import {
   categoryOptions, createOperationIntent, MOVEMENT_LABELS, movementView,
 } from '../lib/reserva/expenses.js'
 import { resolvePeriod, periodFromSearch } from '../lib/reserva/finance-period.js'
+import { periodParams } from '../lib/reserva/finance-client.js'
 import { FINANCE_TABS, tabFromSearch, financeSearch, nextFinanceSearch, urlArena } from '../lib/reserva/finance-nav.js'
 import { canViewFinance, ROLES } from '../lib/auth/permissions.js'
 import { createRequestSequence, runLatest } from '../lib/reserva/latest-request.js'
@@ -689,7 +690,7 @@ await check('D03 filtros: 5 status (padrão Ativas) com aria-pressed; categoria 
   assert.ok(EXP_TAB.includes('api.categories(scope.orgId, true)') && EXP_TAB.includes("c.is_active ? c.name : `${c.name} (inativa)`"))
   assert.ok(EXP_TAB.includes('seqs.overview.invalidate(); seqs.list.invalidate(); seqs.more.invalidate()') && EXP_TAB.includes('seqs.list.invalidate(); seqs.more.invalidate()\n    setStatus(s)'))
   assert.ok(EXP_TAB.includes('seqs.more.invalidate()\n    setMore({ loading: false, error: false })\n    runLatest(seqs.list, () => api.list('), 'carga principal invalida o "mais" antes')
-  assert.ok(EXP_TAB.includes('}, [baseKey, categoryId, status, reload])') && EXP_TAB.includes('}, [baseKey, categoryId, reload])'))
+  assert.ok(EXP_TAB.includes('}, [baseKey, categoryId, status, reload])') && EXP_TAB.includes('}, [baseKey, compareKey, categoryId, reload])'))
 })
 await check('D04 excludes_general: mesma mensagem nas Despesas e no Caixa, só quando o banco sinaliza', () => {
   assert.ok(EXP_TAB.includes("export const GENERAL_EXCLUDED_MSG = 'Despesas gerais da organização não estão incluídas neste filtro.'"))
@@ -875,6 +876,50 @@ await check('K14 Caixa: cursor composto (occurred_at, source_kind, id) e "mais" 
   f.answer((u) => u.includes('after_at'), { items: [{ id: 'OLD-MORE' }], next_cursor: null }); await pm
   f.answer(() => true, { items: [{ id: 'n1' }], next_cursor: null }); await p1
   assert.deepEqual(st.items.map((x) => x.id), ['n1'])
+})
+
+// ---------------------------------------------------------------- 03B.2B-2A.1 — comparação do resumo
+// Identidade de carga = valores das dependências REAIS do efeito (lidas do componente), com baseKey pela
+// fórmula da página e compareKey pela expressão do próprio componente (avaliada, não comparada como texto).
+await check('K15 mesmo from/to + comparação diferente => nova identidade de carga do resumo; base e lista inalteradas', async () => {
+  const pA = resolvePeriod('this_month', '2026-10-15')
+  const pB = resolvePeriod('custom', '2026-10-15', { from: '2026-10-01', to: '2026-10-15' })
+  assert.deepEqual([pA.from, pA.to], [pB.from, pB.to], 'mesmo período principal')
+  assert.notDeepEqual([pA.compare.from, pA.compare.to], [pB.compare.from, pB.compare.to], 'comparação diferente')
+  assert.ok(PAGE_SRC.includes("const baseKey = base ? `${base.organization_id}|${base.arena_id || ''}|${base.from}|${base.to}` : ''"), 'fórmula da baseKey da página')
+  const baseKeyOf = (p) => { const b = periodParams(ORG, null, p); return `${b.organization_id}|${b.arena_id || ''}|${b.from}|${b.to}` }
+  const m = /const compareKey = (`[^`\n]*`)/.exec(EXP_TAB)
+  assert.ok(m, 'compareKey derivada no componente')
+  const compareKeyOf = new Function('scope', `return ${m[1]}`)
+  const depsOf = (anchor) => {
+    const i = EXP_TAB.indexOf(anchor); assert.ok(i > 0, anchor)
+    const j = EXP_TAB.indexOf('}, [', i)
+    return EXP_TAB.slice(j + 4, EXP_TAB.indexOf('])', j)).split(',').map((s) => s.trim())
+  }
+  const ovDeps = depsOf('runLatest(seqs.overview'), listDeps = depsOf('runLatest(seqs.list')
+  assert.ok(!ovDeps.includes('scope'), 'sem o objeto scope inteiro como dependência (recarga por identidade)')
+  const identity = (deps, p) => {
+    const v = { baseKey: baseKeyOf(p), compareKey: compareKeyOf({ orgId: ORG, arenaId: null, period: p }), categoryId: null, status: 'ACTIVE', reload: 0 }
+    return deps.map((d) => { assert.ok(Object.prototype.hasOwnProperty.call(v, d), `dependência desconhecida: ${d}`); return v[d] }).join('§')
+  }
+  assert.equal(baseKeyOf(pA), baseKeyOf(pB), 'chave principal (base) igual')
+  assert.notEqual(identity(ovDeps, pA), identity(ovDeps, pB), 'resumo de despesas recarrega quando só a comparação muda')
+  assert.equal(identity(listDeps, pA), identity(listDeps, pB), 'lista não recarrega (rg_expenses só usa o período principal)')
+  assert.equal(identity(ovDeps, pA), identity(ovDeps, resolvePeriod('this_month', '2026-10-15')), 'mesma intenção => mesma identidade (sem recarga à toa)')
+  // cada limite da comparação conta sozinho: só compare.to muda / só compare.from muda (mesmo from/to)
+  const onlyTo = { ...pA, compare: { ...pA.compare, to: '2026-09-14' } }
+  const onlyFrom = { ...pA, compare: { ...pA.compare, from: '2026-09-02' } }
+  for (const [name, p] of [['só compare.to', onlyTo], ['só compare.from', onlyFrom]]) {
+    assert.equal(baseKeyOf(p), baseKeyOf(pA), `${name}: base igual`)
+    assert.notEqual(identity(ovDeps, p), identity(ovDeps, pA), `${name}: resumo recarrega`)
+    assert.equal(identity(listDeps, p), identity(listDeps, pA), `${name}: lista não recarrega`)
+  }
+  // a carga do resumo de fato envia a comparação de cada período (client real)
+  const urls = []
+  const api = createExpensesApi(async (u) => { urls.push(u); return resp(200, {}) })
+  await api.overview({ orgId: ORG, arenaId: null, period: pA }); await api.overview({ orgId: ORG, arenaId: null, period: pB })
+  assert.ok(urls[0].includes(`compare_from=${pA.compare.from}&compare_to=${pA.compare.to}`) && urls[1].includes(`compare_from=${pB.compare.from}&compare_to=${pB.compare.to}`))
+  assert.notEqual(urls[0], urls[1])
 })
 
 // ------------------------------------------------------------------ resultado
