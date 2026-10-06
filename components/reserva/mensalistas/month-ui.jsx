@@ -2,7 +2,7 @@
 
 // FASE 03B.3B — peças visuais compartilhadas da visão mensal de Mensalistas: badge de status do mês
 // (texto + ícone, nunca só cor), navegação de mês e célula de valor. Só apresentação.
-import { monthStatusMeta, monthLabel, prevMonth, nextMonth, moneyOrDash } from '@/lib/reserva/recurring-month'
+import { monthStatusMeta, monthLabel, capitalizeFirst, prevMonth, nextMonth, moneyOrDash } from '@/lib/reserva/recurring-month'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { AlertTriangle, AlertCircle, CircleDashed, Circle, CheckCircle2, MinusCircle, ChevronLeft, ChevronRight, UserX } from 'lucide-react'
@@ -46,8 +46,8 @@ export function MonthNav({ month, currentMonth, onChange, className, compact = f
         aria-label={prev ? `Mês anterior: ${monthLabel(prev)}` : 'Mês anterior'}>
         <ChevronLeft className="h-4 w-4" />
       </Button>
-      <p className={cn('min-w-[10rem] text-center font-display font-semibold capitalize', compact ? 'text-base' : 'text-lg')} aria-live="polite">
-        {monthLabel(month)}
+      <p className={cn('min-w-[10rem] text-center font-display font-semibold', compact ? 'text-base' : 'text-lg')} aria-live="polite">
+        {capitalizeFirst(monthLabel(month))}
       </p>
       <Button type="button" variant="outline" size="icon" className="h-11 w-11 sm:h-9 sm:w-9" onClick={() => next && onChange(next)} disabled={!next}
         aria-label={next ? `Próximo mês: ${monthLabel(next)}` : 'Próximo mês'}>

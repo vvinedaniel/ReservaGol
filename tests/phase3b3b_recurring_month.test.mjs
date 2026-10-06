@@ -11,7 +11,7 @@ import crypto from 'node:crypto'
 import {
   isMonthParam, monthToDate, dateToMonth, monthOf, shiftMonth, prevMonth, nextMonth, monthLabel, monthName, slotLabel, dayMonth,
   MONTH_STATUSES, MONTH_STATUS_META, MONTH_FILTERS, MONTH_REASON_MSG, validateMonthPaymentDraft, previewMonthSplit, unpricedSeries,
-  monthErrorMessage, monthErrorReason, keepsIntent, validateNewCustomer, validateSeriesPrice, RM_PREFIX,
+  monthErrorMessage, monthErrorReason, keepsIntent, validateNewCustomer, validateSeriesPrice, RM_PREFIX, capitalizeFirst,
 } from '../lib/reserva/recurring-month.js'
 import {
   runRecurringMonthRoute, recurringMonthPathSegments, mapRecurringMonthError, resolveRecurringMonthRoute, RM_ERRORS,
@@ -73,6 +73,12 @@ await check('H01 mês: formato YYYY-MM, limites, navegação (dez->jan, jan->dez
   assert.equal(slotLabel({ frequency: 'WEEKLY', weekday: 2, start_time: '20:00', end_time: '21:00' }), 'Terça · 20:00–21:00')
   assert.equal(slotLabel({ frequency: 'MONTHLY', day_of_month: 10, start_time: '20:00:00', end_time: '21:00:00' }), 'Dia 10 · 20:00–21:00')
   assert.equal(dayMonth('2026-10-03'), '03/10')
+  // bugs do smoke 03B.3B: series[] sem weekday não vira "· 07:00"; rótulo do mês não vira "Outubro De 2026"
+  assert.equal(slotLabel({ frequency: 'WEEKLY', start_time: '07:00:00', end_time: '08:00:00' }), '07:00–08:00')
+  assert.equal(slotLabel({ frequency: 'MONTHLY', start_time: '07:00', end_time: '08:00' }), '07:00–08:00')
+  assert.equal(capitalizeFirst(monthLabel('2026-10')), 'Outubro de 2026')
+  assert.ok(!/font-semibold capitalize/.test(UI) && UI.includes('{capitalizeFirst(monthLabel(month))}'))
+  assert.ok(PRICE.includes('slotLabel(s.series_id === detail.current?.series_id ? { ...detail.current, ...s } : s)'))
 })
 await check('H02 status do mês: os 6 com rótulo + ícone (nunca só cor); filtros incluem Sem cliente', () => {
   assert.deepEqual(MONTH_STATUSES, ['UNPRICED', 'OVERDUE', 'PARTIAL', 'OPEN', 'PAID', 'NO_CHARGE'])

@@ -41,6 +41,8 @@ export function ApplySeriesPriceDialog({ api, detail, month, onClose, onDone, on
   const guard = useRef(null)
   if (!guard.current) guard.current = createSubmitGuard()
   const needsPrice = withoutPrice.length > 0
+  // series[] do detalhe não traz o dia; a série atual da linhagem traz (detail.current).
+  const seriesSlot = (s) => slotLabel(s.series_id === detail.current?.series_id ? { ...detail.current, ...s } : s)
 
   async function savePrices(e) {
     e.preventDefault()
@@ -97,7 +99,7 @@ export function ApplySeriesPriceDialog({ api, detail, month, onClose, onDone, on
           <form onSubmit={savePrices} className="space-y-3" noValidate>
             {withoutPrice.map((s, i) => (
               <div key={s.series_id} className="space-y-1.5">
-                <Label htmlFor={`sp-${s.series_id}`}>Valor por jogo — {slotLabel(s)} · {s.court_name}</Label>
+                <Label htmlFor={`sp-${s.series_id}`}>Valor por jogo — {seriesSlot(s)} · {s.court_name}</Label>
                 <Input id={`sp-${s.series_id}`} className="h-11 sm:h-9" inputMode="decimal" placeholder="150,00" autoFocus={i === 0}
                   value={prices[s.series_id] ?? ''} onChange={(e) => { const v = e.target.value; setPrices((p) => ({ ...p, [s.series_id]: v })); setErrors((x) => ({ ...x, [s.series_id]: undefined })) }}
                   aria-invalid={!!errors[s.series_id]} aria-describedby={errors[s.series_id] ? `sp-${s.series_id}-error` : undefined} />
@@ -116,7 +118,7 @@ export function ApplySeriesPriceDialog({ api, detail, month, onClose, onDone, on
           <div className="space-y-3">
             <ul className="divide-y divide-border rounded-lg border border-border text-sm" aria-label="Valor de cada série">
               {withPrice.map((s) => (
-                <li key={s.series_id} className="flex justify-between gap-2 px-3 py-2"><span className="truncate">{slotLabel(s)} · {s.court_name}</span><span className="tabular-nums">{moneyOrDash(s.default_price)}</span></li>
+                <li key={s.series_id} className="flex justify-between gap-2 px-3 py-2"><span className="truncate">{seriesSlot(s)} · {s.court_name}</span><span className="tabular-nums">{moneyOrDash(s.default_price)}</span></li>
               ))}
             </ul>
             {submitError && <p className="text-sm text-amber-500" role="alert">{submitError}</p>}
