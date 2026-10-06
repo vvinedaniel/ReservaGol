@@ -6,6 +6,9 @@
 // route (no-store, sessão, sem service-role, 03B.1 intacta), client (URLs, no-store, erros, rede) e
 // helpers de apresentação (badges no feminino, ações pelo estado real, diff, validação, intenção,
 // direção do Caixa pelo banco).
+// 03B.2B-2A (UI de leitura): URL das abas (finance-nav), lazy mount, RECEPTIONIST sem chamadas, nenhuma
+// escrita na UI, cards/filtros/lista/detalhe de Despesas, Caixa consolidado, mobile/a11y e corridas
+// (lista, "mais", detalhe A/B, fechar Sheet, cursor composto do Caixa) com runLatest + client reais.
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { parseMoneyToCents, MAX_CENTS } from '../lib/reserva/money.js'
@@ -20,7 +23,10 @@ import {
   reversibleOf, deriveExpenseActions, validateExpenseDraft, buildExpenseChanges, validateEntryDraft, validateReason, validateCategoryName,
   categoryOptions, createOperationIntent, MOVEMENT_LABELS, movementView,
 } from '../lib/reserva/expenses.js'
-import { resolvePeriod } from '../lib/reserva/finance-period.js'
+import { resolvePeriod, periodFromSearch } from '../lib/reserva/finance-period.js'
+import { FINANCE_TABS, tabFromSearch, financeSearch, nextFinanceSearch, urlArena } from '../lib/reserva/finance-nav.js'
+import { canViewFinance, ROLES } from '../lib/auth/permissions.js'
+import { createRequestSequence, runLatest } from '../lib/reserva/latest-request.js'
 
 const read = (f) => fs.readFileSync(new URL(`../${f}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n')
 const stripJsComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/[^\n]*/g, '$1')
@@ -554,6 +560,321 @@ await check('P10 Caixa: rótulo por origem+tipo; direção/sinal SEMPRE do banco
   assert.deepEqual(v({ source: 'EXPENSE', kind: 'PAYMENT', direction: 'IN', signed_amount: 3000 }).slice(1), ['in', '+R$ 30,00', true])
   assert.equal(movementView({ source: 'EXPENSE', kind: 'PAYMENT', direction: 'IN', signed_amount: -3000 }).consistent, false)
   assert.deepEqual(v({ source: 'X', kind: 'Y', direction: 'SIDE', signed_amount: 'abc' }), ['Movimento', 'neutral', '—', false])
+})
+
+// ================================================================== 03B.2B-2A — UI de leitura
+const PAGE_SRC = stripJsComments(read('app/dashboard/financeiro/page.js'))
+const EXP_TAB = stripJsComments(read('components/reserva/finance/expenses-tab.jsx'))
+const DETAIL = stripJsComments(read('components/reserva/finance/expense-detail-sheet.jsx'))
+const CASH_TAB = stripJsComments(read('components/reserva/finance/cash-tab.jsx'))
+const UI = [['page', PAGE_SRC], ['expenses-tab', EXP_TAB], ['detail', DETAIL], ['cash-tab', CASH_TAB]]
+function deferred() { let resolve, reject; const p = new Promise((res, rej) => { resolve = res; reject = rej }); return { p, resolve, reject } }
+const tick = () => new Promise((r) => setImmediate(r))
+const P10 = resolvePeriod('custom', '2026-10-15', { from: '2026-10-01', to: '2026-10-15' })
+const PJUL = resolvePeriod('custom', '2026-10-15', { from: '2026-07-01', to: '2026-07-31' })
+
+// ---------------------------------------------------------------- URL / abas (puro)
+await check('N01 tabFromSearch: sem tab / inválida / repetida => overview; as 4 abas válidas', () => {
+  assert.deepEqual(FINANCE_TABS, ['overview', 'receivables', 'cash', 'expenses'])
+  for (const t of FINANCE_TABS) assert.equal(tabFromSearch(new URLSearchParams({ tab: t })), t)
+  for (const q of ['', 'tab=', 'tab=EXPENSES', 'tab=despesas', 'tab=cash&tab=expenses', 'tab=__proto__']) assert.equal(tabFromSearch(new URLSearchParams(q)), 'overview', q)
+  assert.equal(tabFromSearch(null), 'overview')
+})
+await check('N02 financeSearch: query canônica (período + arena + aba; overview omitida)', () => {
+  const pm = resolvePeriod('this_month', '2026-10-15')
+  assert.equal(financeSearch({ period: pm, arenaId: null, tab: 'overview' }), 'preset=this_month')
+  assert.equal(financeSearch({ period: pm, arenaId: ARENA, tab: 'expenses' }), `preset=this_month&arena=${ARENA}&tab=expenses`)
+  assert.equal(financeSearch({ period: PJUL, arenaId: null, tab: 'cash' }), 'from=2026-07-01&to=2026-07-31&tab=cash')
+  assert.equal(financeSearch({ period: pm, tab: 'lixo' }), 'preset=this_month')
+})
+await check('N03 trocas preservam as outras chaves; parâmetros inválidos antigos não contaminam a URL', () => {
+  const cur = { period: PJUL, arenaId: ARENA, tab: 'expenses' }
+  const pm = resolvePeriod('last7', '2026-10-15')
+  assert.equal(nextFinanceSearch(cur, { tab: 'cash' }), `from=2026-07-01&to=2026-07-31&arena=${ARENA}&tab=cash`, 'aba preserva período e arena')
+  assert.equal(nextFinanceSearch(cur, { period: pm }), `preset=last7&arena=${ARENA}&tab=expenses`, 'período preserva aba e arena')
+  assert.equal(nextFinanceSearch(cur, { arenaId: null }), 'from=2026-07-01&to=2026-07-31&tab=expenses', 'arena preserva aba e período')
+  assert.equal(nextFinanceSearch(cur, { tab: 'overview' }), `from=2026-07-01&to=2026-07-31&arena=${ARENA}`)
+  // URL suja: estado é sempre o validado; nenhuma chave desconhecida é copiada
+  const dirty = new URLSearchParams(`preset=hack&from=2026-99-99&arena=xyz&tab=bad&utm=1&status=PAID`)
+  const p = periodFromSearch(dirty, '2026-10-15')
+  const qs = nextFinanceSearch({ period: p, arenaId: urlArena(dirty.get('arena'), { ready: true, list: [{ id: ARENA }] }), tab: tabFromSearch(dirty) }, { tab: 'cash' })
+  assert.equal(qs, 'preset=this_month&tab=cash')
+})
+await check('N04 urlArena: lista carregada => só arena da organização; antes disso preserva uuid bem formado', () => {
+  const list = [{ id: ARENA }]
+  assert.equal(urlArena(ARENA, { ready: true, list }), ARENA)
+  assert.equal(urlArena(EXP, { ready: true, list }), null, 'arena de outra organização')
+  assert.equal(urlArena(EXP, { ready: false, list: [] }), EXP, 'troca precoce não perde a arena')
+  for (const v of ['x', null, undefined, '']) assert.equal(urlArena(v, { ready: false, list: [] }), null)
+})
+await check('N05 ida e volta: reload em ?tab=expenses reabre Despesas com o mesmo período e arena', () => {
+  for (const [period, arenaId, tab] of [[P10, ARENA, 'expenses'], [resolvePeriod('today', '2026-10-15'), null, 'cash'], [PJUL, null, 'receivables'], [resolvePeriod('last_month', '2026-10-15'), ARENA, 'overview']]) {
+    const sp2 = new URLSearchParams(financeSearch({ period, arenaId, tab }))
+    assert.deepEqual(periodFromSearch(sp2, '2026-10-15'), period); assert.equal(tabFromSearch(sp2), tab); assert.equal(sp2.get('arena'), arenaId)
+  }
+})
+
+// ---------------------------------------------------------------- página: fonte única, lazy, permissão
+await check('L01 aba vem só da URL (sem useState de aba); troca de aba entra no histórico; voltar/avançar troca a aba', () => {
+  assert.ok(PAGE_SRC.includes('const tab = tabFromSearch(searchParams)'))
+  assert.ok(!/useState\('overview'\)|setTab\(/.test(PAGE_SRC), 'sem segunda fonte de verdade')
+  assert.ok(PAGE_SRC.includes("const changeTab = (t) => { if (!FINANCE_TABS.includes(t) || t === tab) return; invalidateFinance(); navigate({ tab: t }, { push: true }) }"))
+  assert.ok(PAGE_SRC.includes('if (push) router.push(url, { scroll: false })') && PAGE_SRC.includes('else router.replace(url, { scroll: false })'))
+  assert.ok(!PAGE_SRC.includes('replaceQuery('), 'troca de período/arena não substitui mais a query inteira')
+})
+await check('L02 só a aba ativa monta e busca; invalidação síncrona cobre as 11 sequências financeiras', () => {
+  assert.ok(PAGE_SRC.includes("{tab === 'cash' && <CashTab api={api}") && PAGE_SRC.includes("{tab === 'expenses' && <ExpensesTab api={api}"))
+  for (const k of ['cashResult', 'cashMoves', 'cashMovesMore', 'expCats', 'expOverview', 'expList', 'expListMore', 'expDetail']) {
+    assert.ok(PAGE_SRC.includes(`${k}: createRequestSequence()`), k)
+  }
+  assert.ok(PAGE_SRC.includes("const FINANCE_SEQS = ['overview', 'rec', 'recMore', 'cashResult', 'cashMoves', 'cashMovesMore', 'expCats', 'expOverview', 'expList', 'expListMore', 'expDetail']"))
+  // desmontar a aba invalida o que ela tinha em andamento (inclusive via voltar/avançar)
+  assert.ok(CASH_TAB.includes('return () => { seqs.result.invalidate(); seqs.moves.invalidate(); seqs.more.invalidate() }'))
+  assert.ok(EXP_TAB.includes('return () => { seqs.list.invalidate(); seqs.more.invalidate() }') && EXP_TAB.includes('return () => seqs.overview.invalidate()') && EXP_TAB.includes('return () => seqs.cats.invalidate()'))
+  assert.ok(DETAIL.includes('return () => seq.invalidate()'))
+})
+await check('L03 RECEPTIONIST: nada da 03B.2 é criado/montado antes do guard canViewFinance (zero chamadas)', async () => {
+  const m = /export default function FinanceiroPage\(\) \{([\s\S]*?)\n\}/.exec(PAGE_SRC)
+  const body = m[1]
+  assert.ok(body.indexOf('if (!canViewFinance(me?.role)) return <FinanceAccessDenied />') < body.indexOf('<FinanceView'))
+  assert.ok(!/createExpensesApi|ExpensesTab|CashTab/.test(body), 'nada da 03B.2 no componente de entrada')
+  const iView = PAGE_SRC.indexOf('function FinanceView(')
+  assert.ok(PAGE_SRC.indexOf('const api = useMemo(() => createExpensesApi(), [])') > iView, 'client só existe dentro da vista autorizada')
+  // modelo do portão: mesma decisão do componente
+  for (const role of [ROLES.RECEPTIONIST, ROLES.PLATFORM_SUPER_ADMIN, undefined]) {
+    const calls = []
+    const api = createExpensesApi(async (u) => { calls.push(u); return resp(200, {}) })
+    if (canViewFinance(role)) { await api.categories(ORG, true); await api.cashResult({ orgId: ORG, arenaId: null, period: P10 }, 'day') }
+    assert.equal(calls.length, 0, String(role))
+  }
+  for (const role of [ROLES.OWNER, ROLES.MANAGER]) assert.equal(canViewFinance(role), true)
+})
+await check('L04 nenhuma escrita na UI desta etapa (sem POST/PATCH, sem formulário, sem ação financeira)', () => {
+  for (const [f, code] of UI) {
+    for (const bad of ['createExpense', 'updateExpense', 'cancelExpense', 'registerPayment', 'reversePayment', 'voidPayment', 'createCategory', 'updateCategory', 'sendExpense', "method: 'POST'", "method: 'PATCH'", 'newOperationId', 'createOperationIntent'])
+      assert.ok(!(/^[A-Za-z]+$/.test(bad) ? new RegExp(`\\b${bad}\\b`).test(code) : code.includes(bad)), `${f}: ${bad}`)
+  }
+  for (const label of ['Nova despesa', 'Editar', 'Registrar pagamento', 'Registrar devolução', 'Anular', 'Cancelar despesa']) {
+    assert.ok(!EXP_TAB.includes(label) && !DETAIL.includes(label), label)
+  }
+  assert.ok(!fs.existsSync(new URL('../components/reserva/finance/expense-forms.jsx', import.meta.url)) && !fs.existsSync(new URL('../components/reserva/finance/expense-categories-dialog.jsx', import.meta.url)))
+})
+await check('L05 toda chamada à API nos componentes passa por runLatest com sequência da página', () => {
+  for (const [f, code, n] of [['expenses-tab', EXP_TAB, 4], ['detail', DETAIL, 1], ['cash-tab', CASH_TAB, 3]]) {
+    const total = (code.match(/api\.\w+\(/g) || []).length
+    const wrapped = (code.match(/runLatest\(seqs?\.?\w*, \(\) => api\.\w+\(/g) || []).length
+    assert.equal(total, n, `${f}: chamadas`); assert.equal(wrapped, total, `${f}: todas via runLatest`)
+  }
+  assert.ok(!/fetch\(/.test(EXP_TAB + DETAIL + CASH_TAB), 'nenhum fetch direto')
+  assert.ok(/status === 403\) onForbidden\(\)/.test(EXP_TAB) && /status === 403\) onForbidden\(\)/.test(DETAIL) && /status === 403\) onForbidden\(\)/.test(CASH_TAB), '403 de leitura => acesso negado')
+})
+
+// ---------------------------------------------------------------- Despesas: conteúdo
+await check('D01 cards: Despesas previstas / Pago / A pagar / Vencidas; Situação atual só nos dois últimos; comparação neutra', () => {
+  for (const label of ['Despesas previstas', 'Pago', 'A pagar', 'Vencidas']) assert.ok(EXP_TAB.includes(`<ExpenseMetric label="${label}"`), label)
+  const card = (label) => { const i = EXP_TAB.indexOf(`<ExpenseMetric label="${label}"`); return EXP_TAB.slice(i, EXP_TAB.indexOf('/>', i)) }
+  assert.ok(card('Despesas previstas').includes('cmpLabel={cmpLabel}') && !card('Despesas previstas').includes('situation'))
+  for (const l of ['A pagar', 'Vencidas']) { assert.ok(card(l).includes('situation'), l); assert.ok(!card(l).includes('cmpLabel'), l) }
+  assert.ok(card('Despesas previstas').includes('d.expected?.current') && card('Pago').includes('d.paid_of_period?.current') && card('A pagar').includes('d.payable?.total') && card('Vencidas').includes('d.overdue?.total'))
+  const metric = /function ExpenseMetric\([^)]*\) \{([\s\S]*?)\n\}/.exec(EXP_TAB)[1]
+  const cmp = metric.slice(metric.indexOf('{hasCompare && ('))
+  assert.ok(!/text-primary|text-red|text-emerald|text-green/.test(cmp), 'comparação de despesa sem cor de bom/ruim')
+})
+await check('D02 semântica explícita: vencimento no período x data real dos pagamentos (Caixa)', () => {
+  assert.ok(EXP_TAB.includes('Os valores desta área consideram despesas com vencimento no período. As Saídas do Caixa consideram a data real dos pagamentos.'))
+  assert.ok(CASH_TAB.includes('Movimentos pela data real do recebimento ou do pagamento.'))
+})
+await check('D03 filtros: 5 status (padrão Ativas) com aria-pressed; categoria com inativas marcadas; troca invalida e zera paginação', () => {
+  assert.ok(EXP_TAB.includes('useState(DEFAULT_EXPENSE_FILTER)') && EXP_TAB.includes('{EXPENSE_STATUS_FILTERS.map((s) => (') && EXP_TAB.includes('aria-pressed={status === s}'))
+  assert.ok(EXP_TAB.includes('api.categories(scope.orgId, true)') && EXP_TAB.includes("c.is_active ? c.name : `${c.name} (inativa)`"))
+  assert.ok(EXP_TAB.includes('seqs.overview.invalidate(); seqs.list.invalidate(); seqs.more.invalidate()') && EXP_TAB.includes('seqs.list.invalidate(); seqs.more.invalidate()\n    setStatus(s)'))
+  assert.ok(EXP_TAB.includes('seqs.more.invalidate()\n    setMore({ loading: false, error: false })\n    runLatest(seqs.list, () => api.list('), 'carga principal invalida o "mais" antes')
+  assert.ok(EXP_TAB.includes('}, [baseKey, categoryId, status, reload])') && EXP_TAB.includes('}, [baseKey, categoryId, reload])'))
+})
+await check('D04 excludes_general: mesma mensagem nas Despesas e no Caixa, só quando o banco sinaliza', () => {
+  assert.ok(EXP_TAB.includes("export const GENERAL_EXCLUDED_MSG = 'Despesas gerais da organização não estão incluídas neste filtro.'"))
+  assert.ok(EXP_TAB.includes('const excludesGeneral = ov.data?.excludes_general === true || list.excludesGeneral') && EXP_TAB.includes('{excludesGeneral && <GeneralExcludedNotice />}'))
+  assert.ok(CASH_TAB.includes('{res.data?.excludes_general === true && <GeneralExcludedNotice />}'))
+})
+await check('D05 lista: campos do contrato, badges do banco (Vencida é flag), linha é <button>, desktop grade / mobile card', () => {
+  for (const f of ['it.description', 'it.category_name', "it.arena_id ? it.arena_name : 'Geral'", 'fmtDueDate(it.due_date)', 'formatCents(it.amount)', 'formatCents(it.net_paid)', 'formatCents(it.amount_due)', '<ExpenseBadges row={it}'])
+    assert.ok(EXP_TAB.includes(f), f)
+  assert.ok(DETAIL.includes('expenseBadges(row).map((b) =>'), 'badges só via expenseBadges (status + flag overdue)')
+  assert.ok(!/'OVERDUE'.*label|status === 'OVERDUE'/.test(EXP_TAB + DETAIL), 'OVERDUE nunca vira status')
+  assert.ok(EXP_TAB.includes('<button type="button" onClick={(e) => onOpen(it.expense_id, e.currentTarget)}'))
+  assert.ok(EXP_TAB.includes('md:grid md:grid-cols-[') && EXP_TAB.includes('flex min-h-11 w-full flex-col'), 'grade no desktop, card no mobile')
+  for (const [f, code] of UI) assert.ok(!/<div[^>]*onClick/.test(code), `${f}: div clicável`)
+})
+await check('D06 vazio / carregando / erro: skeleton com role=status, vazio por status, erro com retry; atualizando sinalizado', () => {
+  assert.ok(EXP_TAB.includes('role="status" aria-label="Carregando despesas"') && EXP_TAB.includes('role="status" aria-label="Carregando resumo"'))
+  assert.ok(EXP_TAB.includes('title="Nenhuma despesa neste filtro" description={EMPTY_BY_STATUS[status] || EMPTY_BY_STATUS.ACTIVE}'))
+  assert.ok(EXP_TAB.includes('Tentar novamente') && CASH_TAB.includes('Tentar novamente') && DETAIL.includes('Tentar novamente'))
+  assert.ok(EXP_TAB.includes('role="status" aria-live="polite"') && EXP_TAB.includes('aria-busy={list.refreshing}'))
+})
+
+// ---------------------------------------------------------------- Detalhe
+await check('S01 Sheet: Title + Description, largura total no mobile, rolagem, foco devolvido ao item, sem ação de escrita', () => {
+  assert.ok(DETAIL.includes('<SheetTitle>') && DETAIL.includes('<SheetDescription>Dados, situação e histórico de lançamentos da despesa selecionada.</SheetDescription>'))
+  assert.ok(DETAIL.includes('className="w-full overflow-y-auto sm:max-w-lg motion-reduce:animate-none motion-reduce:transition-none"'))
+  assert.ok(DETAIL.includes('onCloseAutoFocus={(e) => { const el = returnFocusTo?.current; if (el && el.isConnected) { e.preventDefault(); el.focus() } }}'))
+  for (const f of ['d.category_name', "d.arena_id ? d.arena_name : 'Geral'", 'formatCents(d.amount)', 'fmtDueDate(d.due_date)', 'd.notes', 'formatCents(d.paid_gross)', 'formatCents(d.reversed)', 'formatCents(d.net_paid)', 'formatCents(d.amount_due)'])
+    assert.ok(DETAIL.includes(f), f)
+  for (const f of ["reversal ? 'Devolução' : 'Pagamento'", 'PAYMENT_METHOD_LABELS[e.method]', 'fmtDateTimeLong(e.paid_at)', 'e.void_reason', 'byId[e.reversal_of]', 'Devolução do pagamento']) assert.ok(DETAIL.includes(f), f)
+  assert.ok(!/<Button[^>]*onClick=\{[^}]*(pay|reverse|void|cancel|edit)/i.test(DETAIL), 'nenhum botão de ação financeira')
+})
+
+// ---------------------------------------------------------------- Caixa
+await check('C10 Caixa: 3 cards (in_net / out_net / result), resultado negativo em atenção, sem Saldo/Lucro', () => {
+  const card = (label) => { const i = CASH_TAB.indexOf(`<CashCard label="${label}"`); return CASH_TAB.slice(i, CASH_TAB.indexOf('/>', i)) }
+  assert.ok(card('Entradas').includes('formatCents(t?.in_net)') && card('Saídas').includes('formatCents(t?.out_net)') && card('Resultado de caixa').includes('formatCents(t?.result)'))
+  assert.ok(card('Resultado de caixa').includes("tone={result !== null && result < 0 ? 'warn' : undefined}"))
+  assert.ok(CASH_TAB.includes('Entradas − Saídas registradas no período'))
+})
+await check('C11 gráfico: escala única (|entradas|, |saídas|, |resultado|), zeros => vazio, barras não negativas, sem biblioteca', () => {
+  const chart = /function CashChart\([^)]*\) \{([\s\S]*?)\n\}/.exec(CASH_TAB)[1]
+  assert.ok(chart.includes('Math.abs(v(b.in_net)), Math.abs(v(b.out_net)), Math.abs(v(b.result))'))
+  assert.ok(chart.includes("if (max === 0) return") && chart.includes('Nenhum movimento registrado no período.'))
+  assert.ok(chart.includes('const pct = (x) => (x > 0 ? Math.max(1, Math.floor((x * 100) / max)) : 0)'), 'valor <= 0 não desenha barra; escala inteira')
+  assert.ok(chart.includes("r > 0 ? 'bg-foreground' : 'bg-amber-400'") && chart.includes('role="img"'))
+  assert.ok(!/recharts|chart\.js|from 'd3|@\/components\/ui\/chart/.test(CASH_TAB))
+  // a mesma escala aplicada a cenários extremos (espelho da fórmula do componente)
+  const scale = (buckets) => { const max = buckets.reduce((m, b) => Math.max(m, Math.abs(b.in_net), Math.abs(b.out_net), Math.abs(b.result)), 0); return (x) => (max === 0 ? 0 : x > 0 ? Math.max(1, Math.floor((x * 100) / max)) : 0) }
+  let s = scale([{ in_net: 0, out_net: 0, result: 0 }]); assert.equal(s(0), 0)
+  s = scale([{ in_net: 5000, out_net: 0, result: 5000 }]); assert.equal(s(5000), 100)
+  s = scale([{ in_net: 0, out_net: 7000, result: -7000 }]); assert.equal(s(7000), 100); assert.equal(s(-7000), 0)
+  s = scale([{ in_net: 100000000, out_net: 1, result: 99999999 }]); assert.equal(s(1), 1, 'valor mínimo visível'); assert.equal(s(100000000), 100)
+})
+await check('C12 movimentos: movementView do banco, contraparte (reserva ou despesa), método, chave composta, "mais" invalidado', () => {
+  assert.ok(CASH_TAB.includes("const who = m.source === 'EXPENSE'"), 'só escolhe a CONTRAPARTE exibida pela origem')
+  assert.ok(CASH_TAB.includes('key={`${m.source_kind}:${m.id}`}') && CASH_TAB.includes('PAYMENT_METHOD_LABELS[m.method]') && CASH_TAB.includes('fmtDateTimeLong(m.occurred_at)'))
+  assert.ok(!/m\.source === '(RESERVATION|EXPENSE)' \? '(\+|-|in|out)/.test(CASH_TAB) && !/direction/.test(CASH_TAB.replace(/movementView/g, '')), 'sinal/direção nunca derivados da origem no componente')
+  const eff = CASH_TAB.slice(CASH_TAB.indexOf('useEffect(() => {'))
+  assert.ok(eff.indexOf('seqs.more.invalidate()') < eff.indexOf('runLatest(seqs.result'))
+})
+
+// ---------------------------------------------------------------- mobile / acessibilidade
+await check('A01 mobile 390×844: abas roláveis com 44 px; chips/select/botões novos h-11 sm:h-9|8; dinheiro sem quebra', () => {
+  assert.ok(PAGE_SRC.includes('<div className="-mx-4 overflow-x-auto px-4 sm:mx-0 sm:px-0">') && PAGE_SRC.includes('<TabsList className="inline-flex h-auto w-max">'))
+  assert.ok(PAGE_SRC.includes('className="h-11 px-4 motion-reduce:transition-none sm:h-7 sm:px-3"'))
+  assert.ok(EXP_TAB.includes('className="h-11 shrink-0 px-4 sm:h-8 sm:px-3"') && EXP_TAB.includes('className="h-11 w-full sm:h-9 sm:w-64"'))
+  for (const [f, code] of [['expenses-tab', EXP_TAB], ['cash-tab', CASH_TAB], ['detail', DETAIL]]) {
+    for (const b of code.match(/<Button[^>]*>/g) || []) assert.ok(/h-11/.test(b) || /aria-pressed/.test(b), `${f}: botão sem alvo de 44 px: ${b}`)
+  }
+  for (const code of [EXP_TAB, CASH_TAB, DETAIL]) {
+    for (const m of code.matchAll(/<(span|p)[^>]*>\{formatCents\(/g)) assert.ok(/whitespace-nowrap/.test(m[0]), `valor monetário pode quebrar: ${m[0]}`)
+  }
+  assert.ok(!/<table|overflow-x-scroll/.test(EXP_TAB + CASH_TAB + DETAIL), 'sem tabela horizontal')
+})
+await check('A02 acessibilidade: spinners/transições com reduced motion; carregamentos com role=status; erros com role=alert', () => {
+  for (const [f, code] of [['expenses-tab', EXP_TAB], ['cash-tab', CASH_TAB]]) {
+    for (const m of code.matchAll(/animate-spin[^"]*/g)) assert.ok(m[0].includes('motion-reduce:animate-none'), `${f}: ${m[0]}`)
+    assert.ok(code.includes('role="alert"'), `${f}: erro do "carregar mais" anunciado`)
+  }
+  assert.ok(CASH_TAB.includes('role="status" aria-label="Carregando caixa"') && DETAIL.includes('role="status" aria-label="Carregando despesa"'))
+})
+await check('A03 termos proibidos nas telas novas: faturamento / saldo / lucro', () => {
+  for (const [f, code] of UI) for (const bad of ['faturamento', 'saldo', 'lucro']) assert.ok(!code.toLowerCase().includes(bad), `${f}: ${bad}`)
+})
+
+// ---------------------------------------------------------------- corridas (modelos com runLatest + client reais)
+// Mesma ligação dos componentes: sequências da página, invalidação síncrona na troca de filtro, carga
+// principal invalida o "mais"; fetch controlado por URL (deferred) para forçar ordens adversariais.
+function controlledFetch() {
+  const pending = []
+  const fn = (url) => { const d = deferred(); pending.push({ url, d }); return d.p }
+  const answer = (pred, body) => { const i = pending.findIndex((x) => pred(x.url)); const [x] = pending.splice(i, 1); x.d.resolve(resp(200, body)) }
+  return { fn, pending, answer }
+}
+function expensesModel(fetchImpl) {
+  const api = createExpensesApi(fetchImpl)
+  const seqs = { list: createRequestSequence(), more: createRequestSequence() }
+  const st = { categoryId: null, status: 'ACTIVE', list: { loading: true, refreshing: false, items: [], cursor: null }, more: { loading: false } }
+  const scope = { orgId: ORG, arenaId: null, period: P10 }
+  const loadMain = () => {
+    seqs.more.invalidate(); st.more = { loading: false }
+    return runLatest(seqs.list, () => api.list(scope, { categoryId: st.categoryId, status: st.status, limit: 50 }), {
+      onStart: () => { st.list = { ...st.list, loading: st.list.items.length === 0, refreshing: st.list.items.length > 0, cursor: null } },
+      onResult: (d) => { st.list = { loading: false, refreshing: false, items: d.items, cursor: d.next_cursor || null } },
+    })
+  }
+  const loadMore = () => runLatest(seqs.more, () => api.list(scope, { categoryId: st.categoryId, status: st.status, limit: 50, cursor: st.list.cursor }), {
+    onStart: () => { st.more = { loading: true } },
+    onResult: (d) => { st.list = { ...st.list, items: [...st.list.items, ...d.items], cursor: d.next_cursor || null } },
+    onSettled: () => { st.more = { loading: false } },
+  })
+  const changeStatus = (s) => { seqs.list.invalidate(); seqs.more.invalidate(); st.status = s; return loadMain() }
+  const changeCategory = (c) => { seqs.list.invalidate(); seqs.more.invalidate(); st.categoryId = c; return loadMain() }
+  return { st, loadMain, loadMore, changeStatus, changeCategory }
+}
+const ids = (s) => s.list.items.map((x) => x.expense_id)
+
+await check('K10 filtro trocado com carga pendente: resposta antiga nunca sobrescreve o filtro novo', async () => {
+  const f = controlledFetch(); const m = expensesModel(f.fn)
+  const p1 = m.loadMain(); await tick()
+  const p2 = m.changeStatus('PAID'); await tick()
+  f.answer((u) => u.includes('status=PAID'), { items: [{ expense_id: 'paid-1' }], next_cursor: null }); await p2
+  f.answer((u) => u.includes('status=ACTIVE'), { items: [{ expense_id: 'active-OLD' }], next_cursor: { due_date: '2026-10-02', id: EXP } }); await p1
+  assert.deepEqual(ids(m.st), ['paid-1']); assert.equal(m.st.list.cursor, null)
+})
+await check('K11 período/categoria trocados fora de ordem: só a última intenção aplica', async () => {
+  const f = controlledFetch(); const m = expensesModel(f.fn)
+  const a = m.changeCategory(CAT); await tick()
+  const b = m.changeCategory(null); await tick()
+  const c = m.changeCategory('9a3c7e10-2b4d-4f6a-8c9e-1d2f3a4b5c6d'); await tick()
+  f.answer((u) => u.includes('category_id=9a3c'), { items: [{ expense_id: 'C' }] }); await c
+  f.answer((u) => u.includes(`category_id=${CAT}`), { items: [{ expense_id: 'A' }] }); await a
+  f.answer(() => true, { items: [{ expense_id: 'B' }] }); await b
+  assert.deepEqual(ids(m.st), ['C'])
+})
+await check('K12 "carregar mais" pendente é descartado por nova carga principal; refresh mantém conteúdo marcado', async () => {
+  const f = controlledFetch(); const m = expensesModel(f.fn)
+  const p0 = m.loadMain(); await tick()
+  f.answer(() => true, { items: [{ expense_id: 'e1' }], next_cursor: { due_date: '2026-10-05', id: EXP } }); await p0
+  const pm = m.loadMore(); await tick()
+  assert.ok(f.pending[0].url.includes(`after_due=2026-10-05&after_id=${EXP}`), 'cursor (due_date, id) da RPC')
+  const pr = m.changeStatus('OPEN'); await tick()
+  assert.equal(m.st.list.refreshing, true); assert.deepEqual(ids(m.st), ['e1'], 'conteúdo anterior visível enquanto atualiza')
+  assert.equal(m.st.list.cursor, null, 'paginação zerada')
+  f.answer((u) => u.includes('after_due'), { items: [{ expense_id: 'MORE-OLD' }], next_cursor: null }); await pm
+  assert.ok(!ids(m.st).includes('MORE-OLD'), 'mais antigo descartado')
+  f.answer(() => true, { items: [{ expense_id: 'o1' }], next_cursor: null }); await pr
+  assert.deepEqual(ids(m.st), ['o1']); assert.equal(m.st.list.refreshing, false)
+})
+await check('K13 detalhe: abre A, abre B, B responde, A responde depois => fica B; fechar invalida a pendente', async () => {
+  const f = controlledFetch(); const api = createExpensesApi(f.fn)
+  const seq = createRequestSequence()
+  const st = { data: null, loading: false }
+  const open = (id) => runLatest(seq, () => api.detail(id), { onStart: () => { st.loading = true; st.data = null }, onResult: (d) => { st.loading = false; st.data = d } })
+  const A = 'aaaaaaaa-1d3b-4c55-9a77-0b8e2d4c6f10', B = 'bbbbbbbb-1d3b-4c55-9a77-0b8e2d4c6f10'
+  const pa = open(A); await tick()
+  seq.invalidate() // cleanup do efeito ao trocar expenseId
+  const pb = open(B); await tick()
+  f.answer((u) => u.endsWith(B), { expense_id: B }); await pb
+  f.answer((u) => u.endsWith(A), { expense_id: A }); await pa
+  assert.equal(st.data.expense_id, B)
+  // fechar o Sheet com C pendente: nada é aplicado depois
+  const C = 'cccccccc-1d3b-4c55-9a77-0b8e2d4c6f10'
+  const pc = open(C); await tick()
+  seq.invalidate() // closeDetail + cleanup do componente
+  f.answer((u) => u.endsWith(C), { expense_id: C }); await pc
+  assert.equal(st.data, null, 'resposta depois de fechar não altera estado')
+  assert.ok(EXP_TAB.includes('const closeDetail = () => { seqs.detail.invalidate(); setOpenId(null) }'))
+})
+await check('K14 Caixa: cursor composto (occurred_at, source_kind, id) e "mais" descartado por nova carga', async () => {
+  const f = controlledFetch(); const api = createExpensesApi(f.fn)
+  const seqs = { moves: createRequestSequence(), more: createRequestSequence() }
+  const st = { items: [], cursor: null }
+  const scope = { orgId: ORG, arenaId: null, period: P10 }
+  const loadMain = () => { seqs.more.invalidate(); return runLatest(seqs.moves, () => api.cashMovements(scope, { limit: 50 }), { onStart: () => { st.items = []; st.cursor = null }, onResult: (d) => { st.items = d.items; st.cursor = d.next_cursor } }) }
+  const loadMore = () => runLatest(seqs.more, () => api.cashMovements(scope, { limit: 50, cursor: st.cursor }), { onResult: (d) => { st.items = [...st.items, ...d.items]; st.cursor = d.next_cursor } })
+  const p0 = loadMain(); await tick()
+  f.answer(() => true, { items: [{ id: 'm1' }], next_cursor: { occurred_at: '2026-10-03T15:00:00+00:00', source_kind: 2, id: PAY } }); await p0
+  const pm = loadMore(); await tick()
+  assert.ok(f.pending[0].url.includes(`after_at=2026-10-03T15%3A00%3A00%2B00%3A00&after_source=2&after_id=${PAY}`))
+  const p1 = loadMain(); await tick()
+  f.answer((u) => u.includes('after_at'), { items: [{ id: 'OLD-MORE' }], next_cursor: null }); await pm
+  f.answer(() => true, { items: [{ id: 'n1' }], next_cursor: null }); await p1
+  assert.deepEqual(st.items.map((x) => x.id), ['n1'])
 })
 
 // ------------------------------------------------------------------ resultado
