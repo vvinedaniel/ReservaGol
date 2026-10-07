@@ -182,6 +182,11 @@ begin
   insert into public.arenas (organization_id, name) values (v_org, 'A1 ' || v_tag) returning id into v_a1;
   insert into public.arenas (organization_id, name) values (v_org, 'A2 ' || v_tag) returning id into v_a2;
   insert into public.arenas (organization_id, name) values (v_org2, 'B1 ' || v_tag) returning id into v_b1;
+  -- 03C (setup apenas): horário de funcionamento explícito que cobre todos os horários materializados
+  -- por esta suíte (10:00–22:00); 06:00–23:00 todos os dias. Nenhuma assertion alterada.
+  insert into public.business_hours (organization_id, arena_id, weekday, open_time, close_time, closed)
+  select a.organization_id, a.id, w, '06:00', '23:00', false from public.arenas a cross join generate_series(0, 6) w
+   where a.id in (v_a1, v_a2, v_b1);
   insert into fx values ('owner', u_owner), ('mgr', u_mgr), ('rec', u_rec), ('out', u_out), ('adm', u_adm), ('str', u_str),
     ('org', v_org), ('org2', v_org2), ('a1', v_a1), ('a2', v_a2), ('b1', v_b1);
   with x as (insert into public.courts (organization_id, arena_id, name) values (v_org, v_a1, 'Quadra 1') returning id) insert into fx select 'c1', id from x;

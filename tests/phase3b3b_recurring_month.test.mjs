@@ -332,17 +332,18 @@ await check('S05 page.js: Mês é a view padrão; Séries preserva CreateDialog/
 
 // ------------------------------------------------------------------ escopo e contratos congelados
 await check('R01 GET /recurring-reservations e /:id são leitura PURA (sem top-up); PATCH/geração explícita preservados', () => {
-  const list = ROUTE.slice(ROUTE.indexOf('// GET /recurring-reservations?organization_id=&status=&q='), ROUTE.indexOf('// GET /recurring-reservations/:id  -> detalhe'))
+  const list = ROUTE.slice(ROUTE.indexOf('// GET /recurring-reservations?organization_id=&status=&q='), ROUTE.indexOf('// GET /recurring-reservations/:id/gaps'))  // 03C: lacunas = rota de leitura própria
   const det = ROUTE.slice(ROUTE.indexOf('// GET /recurring-reservations/:id  -> detalhe'), ROUTE.indexOf('// PATCH /recurring-reservations/:id'))
   for (const [n, b] of [['lista', list], ['detalhe', det]]) {
     assert.ok(b.length > 100, n)
     assert.ok(!/topUpForRead|topUpSeries|rg_recurring_generate|\.rpc\(/.test(b), `${n}: GET escreve`)
   }
-  assert.ok(ROUTE.includes("await topUpForRead(supabase, series, 'patch')"), 'PATCH inalterado')
-  assert.ok(ROUTE.includes("const { data, error } = await supabase.rpc('rg_recurring_generate', { p_series_id: id, p_dates: prev.toCreate })"), 'geração explícita')
+  // 03C (freeze aprovado): PATCH NÃO materializa; geração explícita = rg_recurring_topup (gestor, mesma regra do job)
+  assert.ok(!/topUpForRead|topUpSeries/.test(ROUTE), 'reabastecimento implícito removido (PATCH incluso)')
+  assert.ok(ROUTE.includes("const { data, error } = await supabase.rpc('rg_recurring_topup', { p_series_id: id })"), 'geração explícita')
 })
-await check('R02 Agenda fora do escopo: GET /api/agenda e a tela da Agenda inalterados', () => {
-  assert.ok(ROUTE.includes("for (const s of (aSeries || [])) { await topUpForRead(supabase, s, 'agenda') }"), 'Agenda mantém o comportamento (dívida conhecida)')
+await check('R02 Agenda: GET /api/agenda é leitura PURA desde a 03C (dívida da 03B.3 resolvida); tela da Agenda sem dependência mensal', () => {
+  assert.ok(!/topUpForRead|aSeries/.test(ROUTE) && ROUTE.includes('// 03C: leitura PURA — a Agenda não materializa recorrência'), 'Agenda sem reabastecimento')
   assert.ok(!stripJs(read('app/dashboard/agenda/page.js')).includes('recurring-month'))
 })
 await check('R03 03B.3A congelada: migration/rollback com o hash do commit aplicado em Production', () => {

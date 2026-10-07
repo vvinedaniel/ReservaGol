@@ -137,17 +137,25 @@ function routeRpcCalls(src) {
   }
   return calls
 }
-await check('B3-12 cada .rpc() do route usa EXATAMENTE os parâmetros da RPC no draft FOUNDATION', () => {
+// 03C: "Gerar próximas" passou a usar rg_recurring_topup (caminho explícito da 03C) e as lacunas rg_recurring_gaps;
+// rg_recurring_generate segue na B3 por compatibilidade do app anterior durante o rollout, mas o route não a chama.
+const PHASE3C = 'supabase/migration_phase3c_recurring_deterministic.sql'
+await check('B3-12 cada .rpc() do route usa EXATAMENTE os parâmetros da RPC (B3 FOUNDATION + 03C)', () => {
   if (!exists(FOUNDATION)) { console.log('      (draft FOUNDATION ausente neste checkout)'); return 'SKIP' }
-  const sigs = sqlSignatures(read(FOUNDATION))
-  assert.deepEqual(Object.keys(sigs).sort(), ['rg_recurring_cancel', 'rg_recurring_create', 'rg_recurring_generate', 'rg_recurring_pause', 'rg_recurring_reactivate', 'rg_recurring_reschedule', 'rg_recurring_update'])
+  const b3 = sqlSignatures(read(FOUNDATION))
+  assert.deepEqual(Object.keys(b3).sort(), ['rg_recurring_cancel', 'rg_recurring_create', 'rg_recurring_generate', 'rg_recurring_pause', 'rg_recurring_reactivate', 'rg_recurring_reschedule', 'rg_recurring_update'])
+  const p3c = sqlSignatures(read(PHASE3C).replace(/create function public\./gi, 'create or replace function public.'))
+  assert.deepEqual(Object.keys(p3c).sort(), ['rg_recurring_gaps', 'rg_recurring_topup'])
+  const sigs = { ...b3, ...p3c }
   const calls = routeRpcCalls(ROUTE)
   assert.ok(calls.length >= 10, `chamadas encontradas: ${calls.length}`)
   for (const c of calls) {
     assert.ok(sigs[c.fn], `RPC inexistente: ${c.fn}`)
     assert.deepEqual(c.keys, sigs[c.fn], `${c.fn}: route ${JSON.stringify(c.keys)} x SQL ${JSON.stringify(sigs[c.fn])}`)
   }
-  for (const fn of Object.keys(sigs)) assert.ok(calls.some((c) => c.fn === fn), `route não usa ${fn}`)
+  for (const fn of Object.keys(sigs).filter((f) => f !== 'rg_recurring_generate')) assert.ok(calls.some((c) => c.fn === fn), `route não usa ${fn}`)
+  assert.ok(!calls.some((c) => c.fn === 'rg_recurring_generate'), 'route não deve mais chamar rg_recurring_generate (03C)')
+  assert.ok(b3.rg_recurring_generate, 'rg_recurring_generate continua existindo na B3 (compatibilidade durante o rollout)')
 })
 await check('B3-13 create/reschedule exigem operation_id UUID e fazem preflight ANTES do preview', () => {
   for (const [start, end] of [["if (method === 'POST' && !id) {", '// GET /recurring-reservations?'], ["sub === 'reschedule') {", 'return json({ error: `Rota']]) {

@@ -299,7 +299,7 @@ function ReservationDialog({ open, onClose, orgId, arenaId, date, courts, initia
       ? await fetch(`/api/reservations/${edit.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       : await fetch('/api/reservations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
     setSaving(false)
-    if (res.status === 409) { toast.error('Horário indisponível', { description: 'Este horário acabou de ficar indisponível. Escolha outro horário.' }); onSaved(); return }
+    if (res.status === 409) { const e409 = await res.json().catch(() => ({})); toast.error('Horário indisponível', { description: e409.error || 'Este horário acabou de ficar indisponível. Escolha outro horário.' }); onSaved(); return }
     if (!res.ok) { const e = await res.json().catch(() => ({})); toast.error('Não foi possível salvar', { description: e.error }); return }
     const saved = await res.json().catch(() => ({}))
     // 03A FIX2: com lançamento financeiro ativo o banco preserva o valor ao mudar data/horário/quadra.
@@ -376,7 +376,7 @@ function BlockDialog({ open, onClose, orgId, arenaId, date, courts, initial, onS
     setSaving(true)
     const res = await fetch('/api/reservations/block', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ organization_id: orgId, arena_id: arenaId, court_id: form.court_id, date: form.date, start_time: form.start, end_time: form.end, reason: form.reason }) })
     setSaving(false)
-    if (res.status === 409) { toast.error('Horário indisponível', { description: 'Este horário acabou de ficar indisponível. Escolha outro horário.' }); onSaved(); return }
+    if (res.status === 409) { const e409 = await res.json().catch(() => ({})); toast.error('Horário indisponível', { description: e409.error || 'Este horário acabou de ficar indisponível. Escolha outro horário.' }); onSaved(); return }
     if (!res.ok) { toast.error('Não foi possível bloquear'); return }
     toast.success('Horário bloqueado'); onClose(); onSaved()
   }

@@ -171,6 +171,11 @@ begin
     (v_org, u_owner, 'OWNER', 'ACTIVE'), (v_org, u_mgr, 'MANAGER', 'ACTIVE'), (v_org, u_rec, 'RECEPTIONIST', 'ACTIVE'), (v_org2, u_out, 'OWNER', 'ACTIVE');
   insert into public.arenas (organization_id, name) values (v_org, 'Arena ' || v_tag) returning id into v_arena;
   insert into public.arenas (organization_id, name) values (v_org2, 'Arena outra ' || v_tag) returning id into v_arena2;
+  -- 03C (setup apenas): horário de funcionamento explícito que cobre todos os horários materializados
+  -- por esta suíte (08:00–19:00); 06:00–23:00 todos os dias. Nenhuma assertion alterada.
+  insert into public.business_hours (organization_id, arena_id, weekday, open_time, close_time, closed)
+  select a.organization_id, a.id, w, '06:00', '23:00', false from public.arenas a cross join generate_series(0, 6) w
+   where a.id in (v_arena, v_arena2);
   insert into public.courts (organization_id, arena_id, name) values (v_org, v_arena, 'Q1') returning id into v_c1;
   insert into public.courts (organization_id, arena_id, name) values (v_org, v_arena, 'Q2') returning id into v_c2;
   insert into public.courts (organization_id, arena_id, name) values (v_org2, v_arena2, 'Q outra') returning id into v_cout;
@@ -367,7 +372,7 @@ begin
        and t.tgtype & 2 = 2 and t.tgtype & 16 = 16)
     = array['enforce_reservation_tenant', 'enforce_reservation_zz_price_guard', 'enforce_reservation_zz_price_origin_guard',
             'enforce_reservation_zz_price_reprice', 'protect_occurrence_anchor', 'protect_reservation_links', 'trg_reservations_updated',
-            'validate_reservation_recurring'], 'pg_trigger');
+            'validate_reservation_recurring', 'validate_reservation_zz_series_slot'], 'pg_trigger');  -- 03C: + trigger estrutural (ordem anterior preservada)
   perform pg_temp.p3_ok('S02 guards SECURITY INVOKER; recálculo SECURITY DEFINER; owner postgres; search_path vazio; sem EXECUTE para a API',
     (select not prosecdef from pg_proc where oid = 'private.enforce_reservation_price_guard()'::regprocedure)
     and (select not prosecdef and pg_get_userbyid(proowner) = 'postgres' and proconfig = array['search_path=""'] from pg_proc where oid = 'private.enforce_reservation_price_origin_guard()'::regprocedure)

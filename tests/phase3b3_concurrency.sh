@@ -93,6 +93,9 @@ mk_org() {
         insert into public.organizations (name, is_demo) values ('P3B3C $1', true) returning id into o;
         insert into public.organization_members (organization_id, user_id, role, status) values (o, u, 'OWNER', 'ACTIVE'), (o, r, 'RECEPTIONIST', 'ACTIVE');
         insert into public.arenas (organization_id, name) values (o, 'Arena $1') returning id into a;
+        -- 03C (setup apenas): horário explícito cobrindo 08:00–22:59 usados pelo harness; nenhuma assertion alterada.
+        insert into public.business_hours (organization_id, arena_id, weekday, open_time, close_time, closed)
+        select o, a, w, '06:00', '23:00', false from generate_series(0, 6) w;
         insert into public.courts (organization_id, arena_id, name) values (o, a, 'Quadra $1') returning id into c;
         insert into public.customers (organization_id, arena_id, name, phone) values (o, a, 'Cliente $1', null) returning id into cu;
         raise notice 'FX % % % % % %', u, r, o, a, c, cu;
