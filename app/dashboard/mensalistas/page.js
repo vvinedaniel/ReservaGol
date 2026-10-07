@@ -3,7 +3,8 @@
 import { Suspense, useEffect, useState, useCallback, useRef } from 'react'
 import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import { useMe } from '@/components/reserva/dashboard-shell'
-import { isManagerOrAbove } from '@/lib/auth/permissions'
+import { isManagerOrAbove, canViewFinance } from '@/lib/auth/permissions'
+import { SeriesGaps } from '@/components/reserva/mensalistas/series-gaps'
 import { fmtDateTimeLong, isValidDateStr, firstSeriesDate } from '@/lib/reserva/time'
 import { newOperationId } from '@/lib/reserva/operation-id'
 import { invalidateIntentOnChange } from '@/lib/reserva/intent'
@@ -181,7 +182,7 @@ function SeriesView({ me, onOpenMonth }) {
       )}
 
       {openCreate && arena && <CreateDialog orgId={orgId} arena={arena} courts={courts} onClose={() => setOpenCreate(false)} onCreated={() => { setOpenCreate(false); load() }} />}
-      {detailId && <DetailSheet id={detailId} canManage={canManage} courts={courts} onClose={() => setDetailId(null)} onChanged={load} onOpenMonth={onOpenMonth} />}
+      {detailId && <DetailSheet id={detailId} canManage={canManage} canGenerate={canViewFinance(me?.role)} courts={courts} onClose={() => setDetailId(null)} onChanged={load} onOpenMonth={onOpenMonth} />}
     </div>
   )
 }
@@ -353,11 +354,12 @@ function CreateDialog({ orgId, arena, courts, onClose, onCreated }) {
 }
 
 // -------------------------------------------------- Detail
-function DetailSheet({ id, canManage, courts, onClose, onChanged, onOpenMonth }) {
+function DetailSheet({ id, canManage, canGenerate, courts, onClose, onChanged, onOpenMonth }) {
   const [s, setS] = useState(null)
   const [busy, setBusy] = useState(false)
   const [confirm, setConfirm] = useState(null) // {type, ...}
   const [paidAhead, setPaidAhead] = useState(0)
+  const [gapsKey, setGapsKey] = useState(0)
 
   const load = useCallback(async () => {
     const r = await fetch(`/api/recurring-reservations/${id}`)
@@ -375,7 +377,21 @@ function DetailSheet({ id, canManage, courts, onClose, onChanged, onOpenMonth })
     setBusy(false); setConfirm(null)
     if (!r.ok) { toast.error(d.error || 'Não foi possível concluir'); return }
     toast.success(okMsg)
-    await load(); onChanged()
+    await load(); onChanged(); setGapsKey((n) => n + 1)
+  }
+
+  // 03C: "Gerar próximas" = mesma regra do job (até hoje+120), só OWNER/MANAGER. Datas não geradas
+  // aparecem no painel com o motivo (persistido no banco), nunca somem em silêncio.
+  async function generateNow() {
+    setBusy(true)
+    const r = await fetch(`/api/recurring-reservations/${id}/generate`, { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    const d = await r.json().catch(() => ({}))
+    setBusy(false)
+    if (!r.ok) { toast.error(d.error || 'Não foi possível gerar as próximas datas'); return }
+    const gaps = Array.isArray(d.gaps) ? d.gaps.length : 0
+    toast.success(d.created > 0 ? `${d.created} data(s) gerada(s)` : 'Nenhuma data nova para gerar',
+      gaps ? { description: `${gaps} data(s) não gerada(s) — veja o motivo abaixo.` } : undefined)
+    await load(); onChanged(); setGapsKey((n) => n + 1)
   }
 
   async function cancelOccurrence(occId) {
@@ -411,7 +427,7 @@ function DetailSheet({ id, canManage, courts, onClose, onChanged, onOpenMonth })
                 </Button>
               )}
               {!(s.upcoming || []).length && s.status === 'ACTIVE' && (
-                <p className="mt-2 text-xs text-muted-foreground">Sem próximas datas geradas. {canManage ? 'Use “Gerar próximas”.' : 'Peça ao gestor para gerar as próximas datas.'}</p>
+                <p className="mt-2 text-xs text-muted-foreground">Sem próximas datas geradas. As datas são geradas automaticamente a cada hora.{canGenerate ? ' Você também pode usar “Gerar próximas”.' : ''}</p>
               )}
             </div>
 
@@ -419,7 +435,7 @@ function DetailSheet({ id, canManage, courts, onClose, onChanged, onOpenMonth })
               <div className="flex flex-wrap gap-2">
                 {s.status === 'ACTIVE' ? (
                   <>
-                    <Button size="sm" variant="outline" onClick={() => act('generate', {}, 'Próximas reservas geradas')} disabled={busy}><RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Gerar próximas</Button>
+                    {canGenerate && <Button size="sm" variant="outline" className="h-11 sm:h-9" onClick={generateNow} disabled={busy}><RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Gerar próximas</Button>}
                     <Button size="sm" variant="outline" onClick={() => setConfirm({ type: 'pause' })} disabled={busy}><Pause className="mr-1.5 h-3.5 w-3.5" /> Pausar</Button>
                   </>
                 ) : (
@@ -428,6 +444,8 @@ function DetailSheet({ id, canManage, courts, onClose, onChanged, onOpenMonth })
                 <Button size="sm" variant="outline" className="text-destructive" onClick={() => setConfirm({ type: 'cancel' })} disabled={busy}><Ban className="mr-1.5 h-3.5 w-3.5" /> Cancelar série</Button>
               </div>
             )}
+
+            {canGenerate && s.status === 'ACTIVE' && <SeriesGaps seriesIds={[id]} reloadKey={gapsKey} />}
 
             <div>
               <p className="mb-2 text-sm font-semibold">Próximas reservas</p>

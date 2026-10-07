@@ -21,6 +21,7 @@ import { MonthStatusBadge, MonthNav, Money, NoCustomerBadge } from '@/components
 import { ReceiveMonthDialog } from '@/components/reserva/mensalistas/receive-month-dialog'
 import { LinkCustomerDialog } from '@/components/reserva/mensalistas/link-customer-dialog'
 import { ApplySeriesPriceDialog } from '@/components/reserva/mensalistas/apply-series-price-dialog'
+import { SeriesGaps } from '@/components/reserva/mensalistas/series-gaps'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -34,6 +35,7 @@ export function MonthDetailSheet({ api, seq, lineageId, month, currentMonth, man
   const [dlg, setDlg] = useState(null) // 'receive' | 'link' | 'price' | { finance: occurrence }
   const [result, setResult] = useState(null) // split REAL do último recebimento
   const [generating, setGenerating] = useState(false)
+  const [gapsKey, setGapsKey] = useState(0)
   const dlgTrigger = useRef(null)
   const pending = useRef(null)
 
@@ -63,9 +65,14 @@ export function MonthDetailSheet({ api, seq, lineageId, month, currentMonth, man
       const r = await fetch(`/api/recurring-reservations/${encodeURIComponent(id)}/generate`, { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: '{}' })
       const d = await r.json().catch(() => null)
       if (!r.ok) toast.error(typeof d?.error === 'string' ? d.error : 'Não foi possível gerar as próximas datas.')
-      else toast.success(d?.created > 0 ? `${d.created} data(s) gerada(s)` : 'Nenhuma data nova para gerar (conflito ou fora do horário de funcionamento)')
+      else {
+        // 03C: datas não geradas ficam persistidas com o motivo (painel abaixo), nunca somem em silêncio
+        const gaps = Array.isArray(d?.gaps) ? d.gaps.length : 0
+        toast.success(d?.created > 0 ? `${d.created} data(s) gerada(s)` : 'Nenhuma data nova para gerar',
+          gaps ? { description: `${gaps} data(s) não gerada(s) — veja o motivo no mês.` } : undefined)
+      }
     } catch { toast.error('Não foi possível confirmar a resposta do servidor. Atualize e confira.') }
-    finally { setGenerating(false); await afterMutation() }
+    finally { setGenerating(false); setGapsKey((n) => n + 1); await afterMutation() }
   }
 
   const d = st.data
@@ -119,6 +126,12 @@ export function MonthDetailSheet({ api, seq, lineageId, month, currentMonth, man
             {d.missing_future_dates.length > 0 && (
               <div className="rounded-lg border border-dashed border-border px-3 py-3 text-sm">
                 <p className="text-muted-foreground">{d.missing_future_dates.length} data(s) prevista(s) deste mês ainda não gerada(s): {d.missing_future_dates.map(dayMonth).join(', ')}.</p>
+                <p className="mt-1 text-xs text-muted-foreground">As datas são geradas automaticamente a cada hora.{manager ? ' Se alguma não puder ser gerada, o motivo aparece abaixo.' : ''}</p>
+                {manager && (
+                  <div className="mt-2">
+                    <SeriesGaps seriesIds={(d.series || []).map((x) => x.series_id)} onlyDates={d.missing_future_dates} reloadKey={gapsKey} />
+                  </div>
+                )}
                 {manager && (
                   <Button variant="outline" className="mt-2 h-11 sm:h-9" onClick={generate} disabled={generating}>
                     {generating ? <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" /> : <CalendarPlus className="mr-2 h-4 w-4" />}Gerar próximas datas
