@@ -371,7 +371,7 @@ begin
     (select array_agg(t.tgname::text order by t.tgname) from pg_trigger t where t.tgrelid = 'public.reservations'::regclass and not t.tgisinternal
        and t.tgtype & 2 = 2 and t.tgtype & 16 = 16)
     = array['enforce_reservation_tenant', 'enforce_reservation_zz_price_guard', 'enforce_reservation_zz_price_origin_guard',
-            'enforce_reservation_zz_price_reprice', 'protect_occurrence_anchor', 'protect_reservation_links', 'trg_reservations_updated',
+            'enforce_reservation_zz_price_reprice', 'protect_occurrence_anchor', 'protect_reservation_customer', 'protect_reservation_links', 'trg_reservations_updated',
             'validate_reservation_recurring', 'validate_reservation_zz_series_slot'], 'pg_trigger');  -- 03C: + trigger estrutural (ordem anterior preservada)
   perform pg_temp.p3_ok('S02 guards SECURITY INVOKER; recálculo SECURITY DEFINER; owner postgres; search_path vazio; sem EXECUTE para a API',
     (select not prosecdef from pg_proc where oid = 'private.enforce_reservation_price_guard()'::regprocedure)

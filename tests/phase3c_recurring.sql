@@ -766,7 +766,7 @@ begin
     (select array_agg(t.tgname::text order by t.tgname) from pg_trigger t where t.tgrelid = 'public.reservations'::regclass and not t.tgisinternal
        and t.tgtype & 2 = 2 and t.tgtype & 16 = 16)
     = array['enforce_reservation_tenant', 'enforce_reservation_zz_price_guard', 'enforce_reservation_zz_price_origin_guard',
-            'enforce_reservation_zz_price_reprice', 'protect_occurrence_anchor', 'protect_reservation_links', 'trg_reservations_updated',
+            'enforce_reservation_zz_price_reprice', 'protect_occurrence_anchor', 'protect_reservation_customer', 'protect_reservation_links', 'trg_reservations_updated',
             'validate_reservation_recurring', 'validate_reservation_zz_series_slot']);
   perform pg_temp.ok('G08 RLS ligada e sem políticas nas tabelas novas',
     (select bool_and(c.relrowsecurity) from pg_class c where c.oid in ('public.recurring_generation_runs'::regclass,
