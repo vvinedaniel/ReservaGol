@@ -282,6 +282,20 @@ await check('T18 customerSearchFilter: telefone (>=4 dígitos, também sem 55) o
   const v = api.customerSearchFilter('x*%,()"\\:').value
   assert.ok(!/[*%,()"\\:]/.test(v.slice('name.ilike.*'.length, -1)), v)
 })
+await check('T18b C2D: nomes com dígitos são busca por NOME; telefone só quando a consulta inteira tem formato de telefone', () => {
+  assert.deepEqual(api.customerSearchFilter('Cliente 008'), { kind: 'or', value: 'name.ilike.*Cliente 008*' })
+  assert.deepEqual(api.customerSearchFilter('C2C Cliente 2008'), { kind: 'or', value: 'name.ilike.*C2C Cliente 2008*' })
+  assert.deepEqual(api.customerSearchFilter('João 1990'), { kind: 'or', value: 'name.ilike.*João 1990*' })
+  assert.deepEqual(api.customerSearchFilter('41988000008'), { kind: 'or', value: 'phone.like.*41988000008*' })
+  assert.deepEqual(api.customerSearchFilter('41.98800.0008'), { kind: 'or', value: 'phone.like.*41988000008*' })
+  assert.deepEqual(api.customerSearchFilter('(55) 99999-1111'), { kind: 'or', value: 'phone.like.*55999991111*' }) // DDD 55 legítimo: sem variante
+  assert.deepEqual(api.customerSearchFilter('5541988000008'), { kind: 'or', value: 'phone.like.*5541988000008*,phone.like.*41988000008*' })
+  assert.deepEqual(api.customerSearchFilter('008'), { kind: 'or', value: 'name.ilike.*008*' }) // poucos dígitos
+  assert.deepEqual(api.customerSearchFilter('41#98800'), { kind: 'or', value: 'name.ilike.*41 98800*' }) // caractere fora do formato => nome
+  assert.deepEqual(api.customerSearchMode('Cliente 008'), { mode: 'name', text: 'Cliente 008' })
+  assert.deepEqual(api.customerSearchMode(' +55 (41) 98800-0008 '), { mode: 'phone', digits: '5541988000008', digits2: '41988000008' })
+  assert.deepEqual(api.customerSearchMode('   '), { mode: 'none' })
+})
 
 // ================================================================ route.js REAL com cliente gravador
 const log = []
@@ -505,6 +519,49 @@ await check('T31 UI Agenda: editar reserva nunca envia cliente; "Trocar cliente"
   const form = read('components/reserva/customers/customer-form-dialog.jsx')
   assert.ok(form.includes('expectedUpdatedAt: customer.updated_at') && form.includes("'PHONE_IN_USE'") && form.includes("'STALE_UPDATE'"))
   assert.ok(form.includes('res?.created === false') && !/api\.update\([^)]*\)[^\n]*created === false/.test(form), 'existente abre o cadastro, sem update')
+})
+
+// ================================================================ C2D: paridade da classificação JS × SQL (função REAL)
+await check('T32 PARIDADE C2D: customerSearchMode == classificação de public.rg_customer_list (função real, uma org por consulta)', () => {
+  // Por consulta: uma org isolada com N (nome = a consulta, sem telefone) e P (telefone = dígitos, nome neutro).
+  // nome => só N; telefone => só P; vazia => N e P. O que a função DEVOLVE revela o modo usado pelo SQL.
+  const Q = ['Cliente 008', 'C2C Cliente 008', 'C2C Cliente 2008', 'João 1990', 'Sem Telefone 2024', '008', 'Ana 4199',
+    '41988000008', '(41) 98800-0008', '+55 41 98800-0008', '5541988000008', '(55) 99999-1111', '55999991111', '41.98800.0008',
+    '  41 98800 0008  ', '0008', '419', '41#98800', '4198-80a', '+1 202 555 0100', '++41988000008', '41988000008+', '(41)',
+    'árvore 2020', 'ÁRVORE', '%', '_', '1234', '12 3', '\t4198800', '   ']
+  const neutral = 'qqqvvv'
+  const jsonQ = JSON.stringify(Q).replace(/'/g, "''")
+  const sql = `begin;
+create temp table pq (i int, q text, o uuid, u uuid) on commit drop;
+insert into pq select (t.o - 1)::int, t.q, gen_random_uuid(), gen_random_uuid() from jsonb_array_elements_text('${jsonQ}'::jsonb) with ordinality t(q, o);
+insert into auth.users (id, email) select u, 'c2d-par-' || u || '@reservagol.test' from pq;
+insert into public.organizations (id, name, is_demo) select o, 'C2D paridade ' || i, true from pq;
+insert into public.organization_members (organization_id, user_id, role, status) select o, u, 'RECEPTIONIST', 'ACTIVE' from pq;
+insert into public.customers (organization_id, name, phone) select o, q, null from pq;
+insert into public.customers (organization_id, name, phone) select o, '${neutral}', nullif(regexp_replace(q, '[^0-9]', '', 'g'), '') from pq;
+create temp table pr (i int, got text) on commit drop;
+grant insert, select on pr to authenticated;
+do $p$ declare r record; v jsonb; begin
+  for r in select * from pq order by i loop
+    perform set_config('request.jwt.claims', json_build_object('sub', r.u, 'role', 'authenticated')::text, true);
+    set local role authenticated;
+    v := public.rg_customer_list(r.o, r.q, 'ALL', 10);
+    reset role;
+    insert into pr values (r.i, coalesce((select string_agg(case when e->>'name' = '${neutral}' then 'P' else 'N' end, '|' order by (e->>'name' = '${neutral}'))
+                                           from jsonb_array_elements(v->'items') e), ''));
+  end loop;
+end $p$;
+select i || chr(9) || got from pr order by i;
+rollback;`
+  const out = execFileSync('docker', ['exec', '-i', process.env.RG_TEST_CONTAINER || 'rg-p3a-testdb', 'psql', '-U', 'postgres', '-d', 'postgres', '-X', '-q', '-At', '-v', 'ON_ERROR_STOP=1'],
+    { input: sql, encoding: 'utf8' })
+  const got = Object.fromEntries(out.split(/\r?\n/).filter((l) => /^\d+\t/.test(l)).map((l) => { const [i, g] = l.split('\t'); return [Number(i), g ?? ''] }))
+  assert.equal(Object.keys(got).length, Q.length, `SQL devolveu ${Object.keys(got).length}/${Q.length}`)
+  const expect = (q) => { const m = api.customerSearchMode(q); return m.mode === 'phone' ? 'P' : m.mode === 'name' ? 'N' : 'N|P' }
+  const diverge = Q.map((q, i) => ({ q, js: expect(q), sql: got[i] })).filter((x) => x.js !== x.sql)
+  assert.equal(diverge.length, 0, JSON.stringify(diverge))
+  const modes = Q.reduce((a, q) => { const m = api.customerSearchMode(q).mode; a[m] = (a[m] || 0) + 1; return a }, {})
+  return JSON.stringify(modes)
 })
 
 const fails = results.filter(([, s]) => s === 'FAIL').length

@@ -486,7 +486,7 @@ function DetailSheet({ res, orgId, role, courts, canManageSeries, onClose, onEdi
         {res.status !== 'CANCELLED' && (
           <div className="mt-5 space-y-3">
             {res.status !== 'BLOCKED' && !isRecurring && <Button variant="outline" className="w-full" onClick={() => onEdit(res)}><Pencil className="mr-2 h-4 w-4" /> Editar</Button>}
-            {res.status !== 'BLOCKED' && !isRecurring && <Button variant="outline" className="w-full" onClick={() => setChangeCustomer(true)}><UserRoundCog className="mr-2 h-4 w-4" /> Trocar cliente</Button>}
+            {res.status !== 'BLOCKED' && !isRecurring && <Button variant="outline" className="h-11 w-full sm:h-9" onClick={() => setChangeCustomer(true)}><UserRoundCog className="mr-2 h-4 w-4" aria-hidden="true" /> Trocar cliente</Button>}
             {res.status !== 'BLOCKED' && isRecurring && (
               <div className="space-y-2">
                 <p className="text-xs font-medium text-muted-foreground">Editar</p>

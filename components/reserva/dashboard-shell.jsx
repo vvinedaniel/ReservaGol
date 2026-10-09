@@ -160,7 +160,7 @@ export function DashboardShell({ children }) {
             <div className="flex items-center gap-3">
               <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
                 <SheetTrigger asChild>
-                  <Button variant="outline" size="icon" className="lg:hidden"><Menu className="h-5 w-5" /></Button>
+                  <Button variant="outline" size="icon" className="h-11 w-11 lg:hidden" aria-label="Abrir menu de navegação"><Menu className="h-5 w-5" aria-hidden="true" /></Button>
                 </SheetTrigger>
                 <SheetContent side="left" className="w-72 border-sidebar-border bg-sidebar p-0">
                   <SheetTitle className="sr-only">Menu</SheetTitle>
