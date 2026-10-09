@@ -526,8 +526,10 @@ do $$ begin
            join pg_proc p on p.oid = x.f::regproc)
       = 'a=2aae1120c6e600989e6e990f7146c84f,b=76efe0f4059d4a0e1c9908ec2dd6ea08,c=abc31e62476fce8231504ac6ab08426e,d=802aaffab18c9cd364e9deb7da860480,e=c50be816b59dcf74bfb2d17d85435496,f=0b1659ed026745a6718ecdd722925d8a,g=459e7a1f05c22110d2f0e23f543e4a70,h=586cbc97b0f1a840aed77bd885c7ae43,i=61cf25332b9c329c67bbff2540895ed4,j=0f8080e661045f943a24297424fe3744,k=ff9d1a1caf9e031a01db42f1b805a13c,l=3b58975cd02c50293a8e1ccb77724537,m=6a0cba0c41ff8ed9f6703ca26172a27d,n=fc3e8e1ac2d5e56af0580c6d7363bc64'
     and (select md5(replace(prosrc, chr(13), '')) from pg_proc where oid = 'private.rg_recurring_topup_job(text)'::regprocedure) = '1d3091c712cea7b4bdaa5436c7a4169f');
-  perform pg_temp.ok('G05 escrita direta em customers AINDA permitida (M2 fica para depois do app novo)',
-    has_table_privilege('authenticated', 'public.customers', 'INSERT') and has_table_privilege('authenticated', 'public.customers', 'UPDATE'));
+  perform pg_temp.ok('G05 M2-B: escrita direta em customers BLOQUEADA para authenticated (INSERT/UPDATE/DELETE); SELECT mantido; anon sem acesso',
+    not has_table_privilege('authenticated', 'public.customers', 'INSERT') and not has_table_privilege('authenticated', 'public.customers', 'UPDATE')
+    and not has_table_privilege('authenticated', 'public.customers', 'DELETE') and has_table_privilege('authenticated', 'public.customers', 'SELECT')
+    and not has_table_privilege('anon', 'public.customers', 'INSERT') and not has_table_privilege('anon', 'public.customers', 'UPDATE'));
 end $$;
 
 -- ----------------------------------------------------------------------------- resultado
