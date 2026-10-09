@@ -39,10 +39,11 @@ export function LinkCustomerDialog({ api, orgId, lineageId, onClose, onDone, ret
     setFound((s) => ({ ...s, loading: true, error: false }))
     const t = setTimeout(async () => {
       try {
-        const r = await fetch(`/api/customers?organization_id=${encodeURIComponent(orgId)}&phone=${encodeURIComponent(digits)}`, { cache: 'no-store' })
+        // C2B: /api/customers = rg_customer_list (busca e limite no banco) -> { items, next_cursor }
+        const r = await fetch(`/api/customers?organization_id=${encodeURIComponent(orgId)}&q=${encodeURIComponent(digits)}&limit=10`, { cache: 'no-store' })
         const d = r.ok ? await r.json() : null
         if (id !== seq.current) return
-        setFound({ loading: false, items: Array.isArray(d) ? d.slice(0, 10) : [], error: !r.ok })
+        setFound({ loading: false, items: Array.isArray(d?.items) ? d.items : [], error: !r.ok })
       } catch { if (id === seq.current) setFound({ loading: false, items: [], error: true }) }
     }, 250)
     return () => clearTimeout(t)

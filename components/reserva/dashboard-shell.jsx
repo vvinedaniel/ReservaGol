@@ -28,7 +28,7 @@ const NAV = [
   { label: 'Mensalistas', href: '/dashboard/mensalistas', icon: Repeat, feature: FEATURES.MENSALISTAS, ready: true },
   { label: 'Quadras', href: '/dashboard/quadras', icon: LayoutGrid, feature: FEATURES.COURTS, ready: true },
   { label: 'Perfil da arena', href: '/dashboard/perfil', icon: Globe, feature: FEATURES.SETTINGS_ARENA, ready: true },
-  { label: 'Clientes', href: '/dashboard/clientes', icon: Users, feature: FEATURES.CUSTOMERS, ready: false },
+  { label: 'Clientes', href: '/dashboard/clientes', icon: Users, feature: FEATURES.CUSTOMERS, ready: true },
   // 03B.1: Financeiro agregado só para OWNER/MANAGER (canViewFinance), não pela matriz genérica.
   { label: 'Financeiro', href: '/dashboard/financeiro', icon: DollarSign, feature: FEATURES.FINANCE, allow: canViewFinance, ready: true },
   { label: 'Relatórios', href: '/dashboard/relatorios', icon: BarChart3, feature: FEATURES.REPORTS, ready: false },

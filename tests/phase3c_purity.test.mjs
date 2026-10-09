@@ -28,7 +28,9 @@ const CANNED = {
   organization_members: { id: 'm', role: 'OWNER', status: 'ACTIVE', organization: { id: O, name: 'Org' } },
 }
 const READ_RPCS = new Set(['rg_recurring_month_list', 'rg_recurring_month_search', 'rg_recurring_month_detail', 'rg_recurring_gaps',
-  'rg_fin_overview', 'rg_fin_receivables', 'rg_fin_cashflow', 'rg_fin_cash_entries'])
+  'rg_fin_overview', 'rg_fin_receivables', 'rg_fin_cashflow', 'rg_fin_cash_entries',
+  // CLIENTES C2B: GET /api/customers[/:id] = RPCs STABLE de leitura do C2A
+  'rg_customer_list', 'rg_customer_detail'])
 
 const calls = []
 function builder(kind, table) {
@@ -133,6 +135,14 @@ await pureGet('P14 Pública: GET /api/public/arenas', '/api/public/arenas')
 await pureGet('P15 GET /api/me', '/api/me', { expectOk: true })
 await pureGet('P16 GET /api/reservations (lista)', `/api/reservations?organization_id=${O}`)
 await pureGet('P17 GET /api/customers', `/api/customers?organization_id=${O}`, { expectOk: true })
+await pureGet('P17b GET /api/customers/:id (ficha)', `/api/customers/${S}`, { expectOk: true })
+await check('P17c GET /api/customers usa SÓ rg_customer_list (sem leitura direta de tabela)', async () => {
+  const from = calls.length
+  await call('GET', `/api/customers?organization_id=${O}&q=jo`)
+  const seen = calls.slice(from)
+  assert.deepEqual(seen.filter((c) => c.type === 'rpc').map((c) => c.name), ['rg_customer_list'])
+  assert.equal(seen.filter((c) => c.type === 'from').length, 0)
+})
 
 await check('P18 em TODO o percurso GET, nenhuma chamada de rg_recurring_generate / rg_recurring_topup / rg_materialize', async () => {
   const getCalls = calls.filter((c) => c.type === 'rpc' && ['rg_recurring_generate', 'rg_materialize', 'rg_recurring_topup_batch'].includes(c.name))

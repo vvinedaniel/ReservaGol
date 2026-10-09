@@ -11,6 +11,8 @@ import { PAYMENT_METHODS, PRICE_REASONS, normalizeFinanceNotes, NOTES_MAX_CHARS 
 import { runFinanceEndpoint } from '@/lib/reserva/finance-api'
 import { isExpenseEndpoint, financePathSegments, runExpenseRoute } from '@/lib/reserva/expenses-api'
 import { recurringMonthPathSegments, runRecurringMonthRoute } from '@/lib/reserva/recurring-month-api'
+import { runCustomersRoute, runChangeReservationCustomer, customerSearchFilter, mapCustomerError, normalizeCustomerName, normalizeCustomerEmail } from '@/lib/reserva/customers-api'
+import { canonicalBrPhone, isCanonicalBrPhone } from '@/lib/reserva/phone'
 
 // B1: sem headers CORS — a API só é consumida pelo próprio frontend (mesma origem).
 function json(data, status = 200) {
@@ -52,8 +54,8 @@ const CONFLICT_MSG = 'Este horário acabou de ficar indisponível. Escolha outro
 // RECURRING_SLOT). Mensagem genérica: não revela o mensalista; liberar é ação explícita do gestor.
 const SLOT_MSG = 'Horário reservado para um mensalista. Para liberar, o gestor precisa cancelar essa data ou pausar a série em Mensalistas.'
 function conflictMsg(error) { return error?.hint === 'RECURRING_SLOT' ? SLOT_MSG : CONFLICT_MSG }
+const PHONE_INVALID_API_MSG = 'Telefone inválido. Use DDD + número brasileiro, ex.: (41) 99999-1111.'
 
-function normalizePhone(p) { return (p || '').replace(/\D/g, '') }
 function toISO(date, time) { return `${date}T${(time || '').slice(0, 5)}:00${ARENA_OFFSET}` }
 function todayInTZ() { return new Intl.DateTimeFormat('en-CA', { timeZone: ARENA_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()) }
 // Violação de integridade multi-tenant (triggers A2): RGT01 = vínculo com outra
@@ -269,6 +271,8 @@ function rpcErrorResponse(error, ctx = {}) {
   if (code === '23P01') return json({ error: CONFLICT_MSG }, 409)
   if (code === '23505') return json({ error: 'Este mensalista foi alterado por outra operação. Atualize e tente novamente.' }, 409)
   if (isTenantViolation(error)) return json({ error: TENANT_MSG }, 400)
+  // C2A: o telefone do cliente passa pela regra canônica no banco (rg_customer_request)
+  if (code === '22023' && error?.hint === 'INVALID_PHONE') return json({ error: PHONE_INVALID_API_MSG, code: 'INVALID_PHONE' }, 400)
   if (['22023', '23514', '23502', '23503', '22P02', '22007', '22008', 'P0001'].includes(code)) return json({ error: ctx.invalid || 'Dados inválidos para esta operação' }, 400)
   if (['40P01', '40001', '55P03'].includes(code)) return json({ error: 'Operação concorrente em andamento. Tente novamente em instantes.' }, 503)
   console.error('rpc', ctx.op || '?', code || 'sem código')
@@ -345,20 +349,37 @@ function validCents(v, { min = 0 } = {}) { return Number.isSafeInteger(v) && v >
 function validInstant(v) { return typeof v === 'string' && v.length <= 40 && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v) && !Number.isNaN(Date.parse(v)) }
 function validOptionalDate(v) { return v === null || v === undefined || v === '' || isRealDate(v) }
 
-// Resolve or create a customer within the organization (never across orgs). Phone normalized.
-async function resolveCustomerId(supabase, { organization_id, arena_id, customer_id, customer }) {
-  if (customer_id) return customer_id
-  if (!customer || !customer.name) return null
-  const phone = normalizePhone(customer.phone)
-  if (phone) {
-    const { data: existing } = await supabase.from('customers').select('id').eq('organization_id', organization_id).eq('phone', phone).limit(1).maybeSingle()
-    if (existing) return existing.id
+// C2B: cliente da reserva interna. customer_id informado (escolhido na busca) segue como está (o banco garante o
+// tenant); dados do cliente => autoridade C2A rg_customer_resolve (organização + telefone canônico, ON CONFLICT,
+// NUNCA renomeia cliente existente: name_differs volta para a tela avisar). Sem nome => reserva sem cliente.
+// Resolve { ok: true, customer_id, notice } | { ok: false, response }.
+async function resolveReservationCustomer(supabase, body) {
+  if (body.customer_id !== undefined && body.customer_id !== null) {
+    if (!isUuid(body.customer_id)) return { ok: false, response: json({ error: 'Cliente inválido.' }, 400) }
+    if (body.customer !== undefined && body.customer !== null) return { ok: false, response: json({ error: 'Informe o cliente escolhido OU os dados de um novo cliente.' }, 400) }
+    return { ok: true, customer_id: body.customer_id, notice: null }
   }
-  const { data: created, error } = await supabase.from('customers').insert({
-    organization_id, arena_id: arena_id || null, name: customer.name, phone: phone || null, email: customer.email || null,
-  }).select('id').maybeSingle()
-  if (error) throw error
-  return created?.id || null
+  const c = body.customer
+  if (c === undefined || c === null) return { ok: true, customer_id: null, notice: null }
+  if (typeof c !== 'object' || Array.isArray(c)) return { ok: false, response: json({ error: 'Dados do cliente inválidos.' }, 400) }
+  const rawName = typeof c.name === 'string' ? c.name : ''
+  if (!rawName.trim()) return { ok: true, customer_id: null, notice: null }
+  const name = normalizeCustomerName(rawName)
+  if (!name) return { ok: false, response: json({ error: 'Nome do cliente inválido (até 120 caracteres).', code: 'INVALID_NAME' }, 400) }
+  const phone = canonicalBrPhone(typeof c.phone === 'string' ? c.phone : null)
+  if (!phone.ok) return { ok: false, response: json({ error: PHONE_INVALID_API_MSG, code: 'INVALID_PHONE' }, 400) }
+  const email = normalizeCustomerEmail(typeof c.email === 'string' ? c.email : null)
+  if (!email.ok) return { ok: false, response: json({ error: 'E-mail inválido.', code: 'INVALID_EMAIL' }, 400) }
+  const { data, error } = await supabase.rpc('rg_customer_resolve', {
+    p_org: body.organization_id, p_name: name, p_phone: phone.value, p_email: email.value, p_arena: body.arena_id || null, p_origin: 'RESERVATION',
+  })
+  if (error || !data?.customer_id) {
+    const m = mapCustomerError(error || {}, { notFound: 'Organização não encontrada.' })
+    if (m.status === 500) console.error('rpc rg_customer_resolve', error?.code || 'sem resposta')
+    return { ok: false, response: json(m.body, m.status) }
+  }
+  const notice = data.name_differs ? { code: 'EXISTING_CUSTOMER', existing_name: data.existing?.name || null } : null
+  return { ok: true, customer_id: data.customer_id, notice }
 }
 
 async function handleRoute(request, { params }) {
@@ -372,6 +393,8 @@ async function handleRoute(request, { params }) {
     if (resource === 'public') return await handlePublic(request, id, sub, method)
     if (resource === 'finance') return await handleFinance(request, id, sub, method)
     if (resource === 'recurring-month') return await handleRecurringMonth(request, method)
+    if (resource === 'customers') return await handleCustomers(request, method, path.slice(1))
+    if (resource === 'reservations' && sub === 'customer' && path.length === 3) return await handleReservationCustomer(request, id, method)
     const { supabase, user } = await getContext(request)
     if (!user) return json({ error: 'Não autenticado' }, 401)
     const url = new URL(request.url)
@@ -681,30 +704,8 @@ async function handleRoute(request, { params }) {
       }
     }
 
-    // ---------------------------------------------------------- /customers
-    if (resource === 'customers') {
-      const organization_id = url.searchParams.get('organization_id')
-      if (method === 'GET') {
-        const phone = url.searchParams.get('phone')
-        const q = url.searchParams.get('q')
-        let query = supabase.from('customers').select('*').eq('organization_id', organization_id).order('name')
-        if (phone) query = query.ilike('phone', `%${normalizePhone(phone)}%`)
-        const { data, error } = await query.limit(20)
-        if (error) throw error
-        let rows = data || []
-        if (q) { const s = q.toLowerCase(); const ph = normalizePhone(q); rows = rows.filter((c) => (c.name || '').toLowerCase().includes(s) || (c.phone || '').includes(ph)) }
-        return json(rows)
-      }
-      if (method === 'POST') {
-        const body = await readBody(request)
-        const { data, error } = await supabase.from('customers').insert({ organization_id: body.organization_id, arena_id: body.arena_id || null, name: body.name, phone: normalizePhone(body.phone) || null, email: body.email || null }).select().maybeSingle()
-        if (isTenantViolation(error)) return json({ error: 'A arena informada não pertence à mesma organização.' }, 400)
-        if (error) return json({ error: 'Não foi possível salvar o cliente' }, 403)
-        return json(data, 201)
-      }
-    }
+    // /customers: handleCustomers (C2B, RPCs do C2A).
 
-    // ------------------------------------------------------------- /agenda
     if (resource === 'agenda' && method === 'GET') {
       const arena_id = url.searchParams.get('arena_id')
       const date = url.searchParams.get('date')
@@ -806,6 +807,9 @@ async function handleRoute(request, { params }) {
         // 03A: o valor (snapshot) só muda pela ação de valor (RPC rg_reservation_set_price).
         if (body.price !== undefined) return json({ error: 'O valor da reserva é alterado pela ação "Alterar valor".' }, 400)
         if (body.price_source !== undefined) return json({ error: 'A origem do valor é definida pelo sistema.' }, 400)
+        // C2B: editar data/horário/quadra/observação/status NUNCA altera o cliente. A troca é a ação explícita
+        // POST /reservations/:id/customer (rg_reservation_change_customer); o banco também bloqueia (C2A).
+        if (body.customer !== undefined || body.customer_id !== undefined) return json({ error: 'Para trocar o cliente use a ação "Trocar cliente". Atualize a página e tente novamente.', code: 'USE_CHANGE_CUSTOMER' }, 400)
         const { data: before } = await supabase.from('reservations').select('*').eq('id', id).maybeSingle()
         const patch = {}
         if (body.court_id !== undefined) patch.court_id = body.court_id
@@ -819,8 +823,6 @@ async function handleRoute(request, { params }) {
         if (body.date && body.start_time && body.end_time && sameTime(body.start_time, body.end_time)) return json({ error: SAME_TIME_MSG }, 400)
         if (body.date && body.start_time) patch.start_at = toISO(body.date, body.start_time)
         if (body.date && body.end_time) patch.end_at = body.start_time ? endISO(body.date, body.start_time, body.end_time) : toISO(body.date, body.end_time)
-        if (body.customer_id !== undefined) patch.customer_id = body.customer_id
-        else if (body.customer) { try { patch.customer_id = await resolveCustomerId(supabase, { organization_id: body.organization_id, arena_id: body.arena_id, customer: body.customer }) } catch { return json({ error: 'Não foi possível salvar o cliente' }, 400) } }
         // Editar "apenas esta" ocorrência de uma série marca exceção (mantém vínculo p/ histórico).
         if (before?.recurring_reservation_id) patch.is_exception = true
         const { data, error } = await supabase.from('reservations').update(patch).eq('id', id).select('*, customer:customers(id,name,phone), court:courts(id,name)').maybeSingle()
@@ -850,8 +852,9 @@ async function handleRoute(request, { params }) {
         if (body.price_source !== undefined) return json({ error: 'A origem do valor é definida pelo sistema.' }, 400)
         const status = body.status || 'CONFIRMED'
         if (!CREATE_STATUSES.includes(status)) return json({ error: 'Status inválido' }, 400)
-        let customer_id = null
-        try { customer_id = await resolveCustomerId(supabase, body) } catch { return json({ error: 'Não foi possível salvar o cliente' }, 400) }
+        const rc = await resolveReservationCustomer(supabase, body)
+        if (!rc.ok) return rc.response
+        const customer_id = rc.customer_id
         const { data, error } = await supabase.from('reservations').insert({
           organization_id: body.organization_id, arena_id: body.arena_id, court_id: body.court_id, customer_id,
           start_at: toISO(body.date, body.start_time), end_at: endISO(body.date, body.start_time, body.end_time),
@@ -860,14 +863,18 @@ async function handleRoute(request, { params }) {
         if (isTenantViolation(error)) return json({ error: TENANT_MSG }, 400)
         if (error) return json({ error: isConflict(error) ? conflictMsg(error) : 'Não foi possível criar a reserva' }, isConflict(error) ? 409 : 400)
         await supabase.from('audit_logs').insert({ organization_id: body.organization_id, user_id: user.id, action: 'RESERVATION_CREATED', entity_type: 'reservation', entity_id: data?.id })
-        return json(data, 201)
+        return json(rc.notice ? { ...data, customer_notice: rc.notice } : data, 201)
       }
       if (method === 'GET') {
         const organization_id = url.searchParams.get('organization_id')
         if (!organization_id) return json({ error: 'organization_id é obrigatório' }, 400)
         const scope = url.searchParams.get('scope')
         const nowISO = new Date().toISOString()
-        let query = supabase.from('reservations').select('*, customer:customers(id,name,phone), court:courts(id,name), arena:arenas(id,name)').eq('organization_id', organization_id)
+        // C2B: a busca q acontece no banco, ANTES do limit (sem filtro em JS sobre a amostra)
+        const search = customerSearchFilter(url.searchParams.get('q'))
+        if (search.kind === 'empty') return json([])
+        let query = supabase.from('reservations').select(`*, customer:customers${search.kind === 'or' ? '!inner' : ''}(id,name,phone), court:courts(id,name), arena:arenas(id,name)`).eq('organization_id', organization_id)
+        if (search.kind === 'or') query = query.or(search.value, { referencedTable: 'customer' })
         if (scope === 'today') { const d = todayInTZ(); query = query.gte('start_at', `${d}T00:00:00${ARENA_OFFSET}`).lte('start_at', `${d}T23:59:59${ARENA_OFFSET}`) }
         else if (scope === 'upcoming') { query = query.gte('start_at', nowISO).neq('status', 'CANCELLED') }
         else if (scope === 'past') { query = query.lt('end_at', nowISO).neq('status', 'CANCELLED') }
@@ -881,9 +888,7 @@ async function handleRoute(request, { params }) {
         const source = url.searchParams.get('source'); if (source) query = query.eq('source', source)
         const { data, error } = await query.order('start_at', { ascending: scope !== 'past' }).limit(300)
         if (error) throw error
-        let rows = data || []
-        const q = url.searchParams.get('q')
-        if (q) { const s = q.toLowerCase(); const ph = normalizePhone(q); rows = rows.filter((r) => (r.customer?.name || '').toLowerCase().includes(s) || (r.customer?.phone || '').includes(ph)) }
+        const rows = data || []
         return json(rows)
       }
     }
@@ -989,13 +994,17 @@ async function handleRoute(request, { params }) {
         // 03B.3B: leitura PURA — nenhuma ocorrência é gerada aqui. A geração é a ação explícita
         // POST /recurring-reservations/:id/generate ("Gerar próximas"). A Agenda segue fora do escopo.
         const status = url.searchParams.get('status')
-        let q = supabase.from('recurring_reservations').select(RECURRING_SERIES_WITH_RELATIONS).eq('organization_id', organization_id).order('created_at', { ascending: false })
+        // C2B: a busca q acontece no banco (embed !inner + filtro na tabela customers), não em JS
+        const search = customerSearchFilter(url.searchParams.get('q'))
+        if (search.kind === 'empty') return json([])
+        let q = supabase.from('recurring_reservations')
+          .select(search.kind === 'or' ? RECURRING_SERIES_WITH_RELATIONS.replace('customer:customers(', 'customer:customers!inner(') : RECURRING_SERIES_WITH_RELATIONS)
+          .eq('organization_id', organization_id).order('created_at', { ascending: false })
+        if (search.kind === 'or') q = q.or(search.value, { referencedTable: 'customer' })
         if (status) q = q.eq('status', status)
         const { data, error } = await q
         if (error) throw error
-        let rows = data || []
-        const search = url.searchParams.get('q')
-        if (search) { const s = search.toLowerCase(); const ph = normalizePhone(search); rows = rows.filter((r) => (r.customer?.name || '').toLowerCase().includes(s) || (r.customer?.phone || '').includes(ph)) }
+        const rows = data || []
         // next occurrence por série
         const ids = rows.map((r) => r.id)
         const nextByS = {}
@@ -1329,6 +1338,38 @@ async function handleRecurringMonth(request, method) {
   }
 }
 
+// CLIENTES C2B: /api/customers[/:id] — lista/busca paginada, ficha, criar-ou-reaproveitar, editar — sobre as
+// RPCs do C2A via lib/reserva/customers-api.js. Sempre o client da SESSÃO (nunca service-role): o banco decide
+// quem vê, o que é financeiro (só OWNER/MANAGER) e a identidade do cliente. Toda resposta é no-store.
+async function handleCustomers(request, method, segments) {
+  try {
+    const { supabase, user } = await getContext(request)
+    const { searchParams } = new URL(request.url)
+    const rawBody = method === 'POST' || method === 'PATCH' ? await request.text() : null
+    const r = await runCustomersRoute({ method, segments, searchParams, rawBody, user, callRpc: (name, args) => supabase.rpc(name, args) })
+    return jsonNoStore(r.body, r.status)
+  } catch {
+    console.error('API clientes: exceção')
+    return jsonNoStore({ error: 'Erro interno do servidor' }, 500)
+  }
+}
+
+// POST /api/reservations/:id/customer — troca EXPLÍCITA do cliente de uma reserva avulsa (rg_reservation_change_customer:
+// trava, estado obsoleto, bloqueio/cancelada/ocorrência recusados, auditoria na mesma transação).
+async function handleReservationCustomer(request, id, method) {
+  try {
+    if (method !== 'POST') return jsonNoStore({ error: 'Rota não encontrada' }, 404)
+    const { supabase, user } = await getContext(request)
+    const { searchParams } = new URL(request.url)
+    const rawBody = await request.text()
+    const r = await runChangeReservationCustomer({ reservationId: id, searchParams, rawBody, user, callRpc: (name, args) => supabase.rpc(name, args) })
+    return jsonNoStore(r.body, r.status)
+  } catch {
+    console.error('API troca de cliente: exceção')
+    return jsonNoStore({ error: 'Erro interno do servidor' }, 500)
+  }
+}
+
 // ============================ PHASE 02B: PUBLIC API ============================
 // Resposta pública que nunca deve ser guardada em cache (navegador, proxy ou CDN).
 function jsonNoStore(data, status = 200) {
@@ -1415,7 +1456,9 @@ async function handlePublic(request, id, sub, method) {
       if (!isRealDate(body.date)) return json({ error: PUBLIC_ERRORS.date }, 400)
       const name = cleanName(body.name)
       if (!name) return json({ error: PUBLIC_ERRORS.name }, 400)
-      const phone = cleanBrPhone(body.phone)
+      // C2A/C2B: além do formato do A4, o telefone precisa ser canônico (DDD válido; celular com 9; fixo 2–5)
+      const cleaned = cleanBrPhone(body.phone)
+      const phone = cleaned && isCanonicalBrPhone(cleaned) ? cleaned : null
       if (!phone) return json({ error: PUBLIC_ERRORS.phone }, 400)
       const email = cleanEmail(body.email)
       if (!email.ok) return json({ error: PUBLIC_ERRORS.email }, 400)
@@ -1457,10 +1500,19 @@ async function handlePublic(request, id, sub, method) {
       }
       // 5) Só agora: cliente (dedup por telefone dentro da organização) e reserva.
       //    A constraint reservations_no_overlap continua sendo a autoridade final (409).
-      let customer_id = null
-      const { data: exc } = await admin.from('customers').select('id').eq('organization_id', a.organization_id).eq('phone', phone).limit(1).maybeSingle()
-      if (exc) customer_id = exc.id
-      else { const { data: nc } = await admin.from('customers').insert({ organization_id: a.organization_id, arena_id: a.id, name, phone, email: email.value }).select('id').maybeSingle(); customer_id = nc?.id || null }
+      //    C2B: autoridade C2A (ON CONFLICT na identidade organização+telefone; nunca renomeia cliente existente).
+      //    Falha => nenhuma reserva sem cliente: erro limpo, sem vazar detalhe.
+      const { data: resolved, error: resolveError } = await admin.rpc('rg_customer_resolve_public', {
+        p_org: a.organization_id, p_arena: a.id, p_name: name, p_phone: phone, p_email: email.value,
+      })
+      if (resolveError || !resolved?.customer_id) {
+        if (resolveError?.code === '22023' && ['INVALID_PHONE', 'INVALID_NAME', 'INVALID_EMAIL'].includes(resolveError?.hint)) {
+          return json({ error: resolveError.hint === 'INVALID_PHONE' ? PUBLIC_ERRORS.phone : resolveError.hint === 'INVALID_NAME' ? PUBLIC_ERRORS.name : PUBLIC_ERRORS.email }, 400)
+        }
+        console.error('public reserve: resolve customer', resolveError?.code || 'sem resposta')
+        return json({ error: 'Não foi possível concluir a reserva agora. Tente novamente em instantes.' }, 503)
+      }
+      const customer_id = resolved.customer_id
       // B2: public_code com CSPRNG (80 bits). Em colisão do índice UNIQUE do código, repete SÓ o
       // INSERT com um código novo (máx. 3 tentativas). Em 23505/23P01, a corrida de idempotência
       // (mesma arena + idempotency_key) é resolvida ANTES de regenerar ou responder 409.

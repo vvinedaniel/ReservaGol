@@ -21,8 +21,11 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import { ChevronLeft, ChevronRight, Plus, Ban, CalendarDays, Loader2, Clock, Phone, User, Pencil, X, Repeat } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Plus, Ban, CalendarDays, Loader2, Clock, Phone, User, Pencil, X, Repeat, UserRoundCog } from 'lucide-react'
 import { toast } from 'sonner'
+import { createCustomersApi } from '@/lib/reserva/customers-client'
+import { canonicalBrPhone, formatBrPhone, PHONE_INVALID_MSG } from '@/lib/reserva/phone'
+import { ChangeCustomerDialog } from '@/components/reserva/customers/change-customer-dialog'
 import { cn } from '@/lib/utils'
 
 export default function AgendaPage() {
@@ -226,7 +229,7 @@ export default function AgendaPage() {
 
       {dlg && <ReservationDialog open={!!dlg} onClose={() => setDlg(null)} orgId={orgId} arenaId={arenaId} date={date} courts={view === 'week' ? (week?.courts || courts) : courts} initial={dlg} onSaved={() => reloadRef.current()} />}
       {blockDlg && <BlockDialog open={!!blockDlg} onClose={() => setBlockDlg(null)} orgId={orgId} arenaId={arenaId} date={date} courts={view === 'week' ? (week?.courts || courts) : courts} initial={blockDlg} onSaved={() => reloadRef.current()} />}
-      {detail && <DetailSheet res={detail} role={me?.role} canManageSeries={canManageSeries} courts={view === 'week' ? (week?.courts || courts) : courts} onClose={() => setDetail(null)} onChanged={() => reloadRef.current()} onEdit={(r) => { setDetail(null); setDlg({ edit: r, court_id: r.court_id, date: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date(r.start_at)), start: fmtTime(r.start_at), end: fmtTime(r.end_at) }) }} />}
+      {detail && <DetailSheet res={detail} orgId={orgId} role={me?.role} canManageSeries={canManageSeries} courts={view === 'week' ? (week?.courts || courts) : courts} onClose={() => setDetail(null)} onChanged={() => reloadRef.current()} onEdit={(r) => { setDetail(null); setDlg({ edit: r, court_id: r.court_id, date: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date(r.start_at)), start: fmtTime(r.start_at), end: fmtTime(r.end_at) }) }} />}
     </div>
   )
 }
@@ -275,25 +278,40 @@ function ReservationDialog({ open, onClose, orgId, arenaId, date, courts, initia
   })
   const [saving, setSaving] = useState(false)
   const [suggest, setSuggest] = useState([])
+  // C2B: cliente escolhido na sugestão (customer_id). Mexer em nome/telefone desfaz a escolha — nunca renomeia.
+  const [pickedId, setPickedId] = useState(null)
+  const customersApi = useRef(null)
+  if (!customersApi.current) customersApi.current = createCustomersApi()
+  const suggestSeq = useRef(null)
+  if (!suggestSeq.current) suggestSeq.current = createRequestSequence()
+  useEffect(() => () => suggestSeq.current.invalidate(), [])
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }))
+  const setCustomerField = (k) => (e) => { const v = e.target.value; setPickedId(null); setForm((f) => ({ ...f, [k]: v })) }
 
-  async function onPhone(v) {
+  // Sugestões pelo telefone: busca no servidor (rg_customer_list); só a resposta mais recente vale.
+  function onPhone(v) {
+    setPickedId(null)
     setForm((f) => ({ ...f, phone: v }))
-    if (v.replace(/\D/g, '').length >= 4) {
-      const r = await fetch(`/api/customers?organization_id=${orgId}&phone=${encodeURIComponent(v)}`)
-      setSuggest(r.ok ? await r.json() : [])
-    } else setSuggest([])
+    const digits = v.replace(/\D/g, '')
+    if (digits.length < 4) { suggestSeq.current.invalidate(); setSuggest([]); return }
+    runLatest(suggestSeq.current, () => customersApi.current.list({ orgId, q: digits, limit: 5 }), {
+      onResult: (d) => setSuggest(Array.isArray(d?.items) ? d.items : []),
+      onError: () => setSuggest([]),
+    })
   }
 
   async function save() {
+    if (saving) return
     if (!form.court_id) { toast.error('Selecione a quadra'); return }
-    if (!edit && !form.name.trim()) { toast.error('Informe o cliente'); return }
+    if (!edit && !pickedId && !form.name.trim()) { toast.error('Informe o cliente'); return }
+    if (!edit && !pickedId && !canonicalBrPhone(form.phone).ok) { toast.error(PHONE_INVALID_MSG); return }
     setSaving(true)
+    // Editar a reserva NUNCA envia cliente (troca só por "Trocar cliente"); criar envia o escolhido OU os dados.
     const payload = {
       organization_id: orgId, arena_id: arenaId, court_id: form.court_id,
       date: form.date, start_time: form.start, end_time: form.end,
       status: form.status, source: form.source, notes: form.notes,
-      customer: { name: form.name, phone: form.phone, email: form.email },
+      ...(edit ? {} : pickedId ? { customer_id: pickedId } : { customer: { name: form.name, phone: form.phone, email: form.email } }),
     }
     const res = edit
       ? await fetch(`/api/reservations/${edit.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
@@ -305,6 +323,7 @@ function ReservationDialog({ open, onClose, orgId, arenaId, date, courts, initia
     // 03A FIX2: com lançamento financeiro ativo o banco preserva o valor ao mudar data/horário/quadra.
     if (edit && saved.price_review_required) toast.warning('Reserva atualizada. O valor foi mantido porque existem lançamentos financeiros. Revise o valor da reserva.')
     else toast.success(edit ? 'Reserva atualizada' : 'Reserva criada')
+    if (!edit && saved.customer_notice?.code === 'EXISTING_CUSTOMER') toast.info(`Este telefone já estava cadastrado para "${saved.customer_notice.existing_name}". A reserva foi feita no cadastro existente — o nome não foi alterado.`)
     onClose(); onSaved()
   }
 
@@ -313,21 +332,34 @@ function ReservationDialog({ open, onClose, orgId, arenaId, date, courts, initia
       <DialogContent className="max-h-[92vh] overflow-y-auto">
         <DialogHeader><DialogTitle>{edit ? 'Editar reserva' : 'Nova reserva'}</DialogTitle></DialogHeader>
         <div className="space-y-3">
-          <div className="space-y-1.5"><Label>Cliente</Label><Input value={form.name} onChange={set('name')} placeholder="Nome do cliente" /></div>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="relative space-y-1.5">
-              <Label>Telefone</Label>
-              <Input value={form.phone} onChange={(e) => onPhone(e.target.value)} placeholder="(11) 90000-0000" />
-              {suggest.length > 0 && (
-                <div className="absolute z-20 mt-1 w-full rounded-md border border-border bg-popover shadow">
-                  {suggest.slice(0, 5).map((c) => (
-                    <button key={c.id} type="button" onClick={() => { setForm((f) => ({ ...f, name: c.name, phone: c.phone || '' })); setSuggest([]) }} className="block w-full px-3 py-2 text-left text-sm hover:bg-accent">{c.name} <span className="text-muted-foreground">{c.phone}</span></button>
-                  ))}
-                </div>
-              )}
+          {edit ? (
+            <div className="rounded-lg border border-border px-3 py-2 text-sm">
+              <p className="text-xs text-muted-foreground">Cliente</p>
+              <p>{edit.customer?.name || 'Sem cliente'}{edit.customer?.phone ? <span className="text-muted-foreground"> · {formatBrPhone(edit.customer.phone)}</span> : null}</p>
+              <p className="mt-1 text-xs text-muted-foreground">Editar a reserva não muda o cliente. Para trocar, use “Trocar cliente” nos detalhes da reserva.</p>
             </div>
-            <div className="space-y-1.5"><Label>E-mail (opcional)</Label><Input value={form.email} onChange={set('email')} placeholder="cliente@email.com" /></div>
-          </div>
+          ) : (
+            <>
+              <div className="space-y-1.5"><Label htmlFor="rd-name">Cliente</Label><Input id="rd-name" value={form.name} onChange={setCustomerField('name')} placeholder="Nome do cliente" /></div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="relative space-y-1.5">
+                  <Label htmlFor="rd-phone">Telefone</Label>
+                  <Input id="rd-phone" value={form.phone} inputMode="tel" autoComplete="off" onChange={(e) => onPhone(e.target.value)} placeholder="(11) 90000-0000" />
+                  {suggest.length > 0 && (
+                    <div className="absolute z-20 mt-1 w-full rounded-md border border-border bg-popover shadow" role="listbox" aria-label="Clientes cadastrados">
+                      {suggest.slice(0, 5).map((c) => (
+                        <button key={c.id} type="button" role="option" aria-selected={pickedId === c.id}
+                          onClick={() => { setForm((f) => ({ ...f, name: c.name, phone: c.phone ? formatBrPhone(c.phone) : '' })); setPickedId(c.id); setSuggest([]) }}
+                          className="block w-full px-3 py-2 text-left text-sm hover:bg-accent">{c.name} <span className="text-muted-foreground">{c.phone ? formatBrPhone(c.phone) : ''}</span></button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="space-y-1.5"><Label htmlFor="rd-email">E-mail (opcional)</Label><Input id="rd-email" value={form.email} onChange={setCustomerField('email')} placeholder="cliente@email.com" disabled={!!pickedId} /></div>
+              </div>
+              {pickedId && <p className="text-xs text-muted-foreground" aria-live="polite">Cliente cadastrado selecionado. Alterar nome ou telefone desfaz a seleção.</p>}
+            </>
+          )}
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label>Quadra</Label>
@@ -414,8 +446,11 @@ function BlockDialog({ open, onClose, orgId, arenaId, date, courts, initial, onS
   )
 }
 
-function DetailSheet({ res, role, courts, canManageSeries, onClose, onEdit, onChanged }) {
+function DetailSheet({ res, orgId, role, courts, canManageSeries, onClose, onEdit, onChanged }) {
   const m = statusMeta(res.status)
+  const [changeCustomer, setChangeCustomer] = useState(false)
+  const customersApi = useRef(null)
+  if (!customersApi.current) customersApi.current = createCustomersApi()
   const [fin, setFin] = useState(null)
   const [cancelling, setCancelling] = useState(false)
   const [reason, setReason] = useState('')
@@ -451,6 +486,7 @@ function DetailSheet({ res, role, courts, canManageSeries, onClose, onEdit, onCh
         {res.status !== 'CANCELLED' && (
           <div className="mt-5 space-y-3">
             {res.status !== 'BLOCKED' && !isRecurring && <Button variant="outline" className="w-full" onClick={() => onEdit(res)}><Pencil className="mr-2 h-4 w-4" /> Editar</Button>}
+            {res.status !== 'BLOCKED' && !isRecurring && <Button variant="outline" className="w-full" onClick={() => setChangeCustomer(true)}><UserRoundCog className="mr-2 h-4 w-4" /> Trocar cliente</Button>}
             {res.status !== 'BLOCKED' && isRecurring && (
               <div className="space-y-2">
                 <p className="text-xs font-medium text-muted-foreground">Editar</p>
@@ -478,6 +514,7 @@ function DetailSheet({ res, role, courts, canManageSeries, onClose, onEdit, onCh
           </div>
         )}
       </SheetContent>
+      {changeCustomer && <ChangeCustomerDialog api={customersApi.current} orgId={orgId} reservation={res} onClose={() => setChangeCustomer(false)} onChanged={() => { setChangeCustomer(false); onClose(); onChanged() }} />}
       {reschedule && canManageSeries && <RescheduleDialog res={res} courts={courts} onClose={() => setReschedule(false)} onDone={() => { setReschedule(false); onClose(); onChanged() }} />}
     </Sheet>
   )
